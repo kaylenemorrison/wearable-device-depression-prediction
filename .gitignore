@@ -1,0 +1,15 @@
+# --- Data Files ---
+data/
+data_cleaned/
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints/
+
+# --- Mac System Files ---
+.DS_Store
+
+# --- Python Environment ---
+venv/
+.env
+__pycache__/
+*.py[cod]
