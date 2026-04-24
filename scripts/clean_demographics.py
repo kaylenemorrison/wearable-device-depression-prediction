@@ -974,4 +974,6 @@ demographics = demographics[demographics["redcap_event_name"] == 'enrolment_arm_
 
 demographics = demographics.drop(columns = ["redcap_event_name"])
 
-demographics.to_csv(PATH_TO_CLEAN_DATA, index=False)
+demographics.to_csv(PATH_TO_CLEAN_DATA, index = False)
+
+#demographics.to_parquet("data_cleaned/totaldataset.parquet", index=False)
