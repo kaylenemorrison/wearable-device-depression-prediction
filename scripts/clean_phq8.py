@@ -1,8 +1,6 @@
 
 import pandas as pd
 from datetime import datetime
-import random
-random.seed(42)
 
 PATH_TO_TIME_INTERVALS = "../data/radarV1_MDD/csv_files/timeIntervals.csv"
 PATH_TO_PHQ8 = "../data/radarV1_MDD/csv_files/phq8_data.csv"
@@ -57,7 +55,7 @@ def eliminate_duplicates(max_range, phq8_data):
     - Groups by participant and time interval.
     - Computes score range (max - min) within each group.
     - Filters out groups where variability exceeds 'max_range'.
-    - Randomly samples one entry per remaining group.
+    - Keeps the first instance of PHQ8 score per participant per day.
 
     Args:
         max_range (int): Maximum allowed score variation within a group.
@@ -72,11 +70,13 @@ def eliminate_duplicates(max_range, phq8_data):
     )
 
     phq8_data = phq8_data[phq8_data['score_range'] <= max_range]
+
+    phq8_data = phq8_data.sort_values(by=['participant_name', 'time_interval'])
+
     phq8_data = (
-    phq8_data.groupby(['participant_name', 'time_interval'], group_keys=False)
-      .apply(lambda x: x.sample(n=1))
-      .reset_index(drop=True)
-    ) 
+        phq8_data.groupby(['participant_name', 'time_interval'], as_index=False)
+        .first()
+    )
     return phq8_data
 
 def merge_with_intervals(time_intervals, phq8_data):

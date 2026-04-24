@@ -93,9 +93,12 @@ def main():
     sleep = pd.read_csv(PATH_TO_SLEEP)
     demographics = pd.read_csv(PATH_TO_DEMOGRAPHICS)
 
-    phq8_missingness_adjusted = remove_missingness(phq8, sleep, 14, 7)
+    window_size = 14
+    missing_threshold = 7
 
-    phq8_merged_with_sleep = merge_with_sleep(phq8_missingness_adjusted, sleep, 14)
+    phq8_missingness_adjusted = remove_missingness(phq8, sleep, window_size, missing_threshold)
+
+    phq8_merged_with_sleep = merge_with_sleep(phq8_missingness_adjusted, sleep, window_size)
 
     # merge with demographics
     final_dataset = phq8_merged_with_sleep.merge(
