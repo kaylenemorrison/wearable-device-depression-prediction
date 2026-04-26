@@ -1034,3 +1034,6 @@ demographics["depression_medication"] = demographics["depression_medication"].re
     #]
 
 demographics.to_csv(PATH_TO_CLEAN_DATA, index = False)
+
+# create missing category for categorical variables with missing values (ethnicity_1 and accommodation)
+# impute boolean, numeric, and ordinal variables with missing values 
