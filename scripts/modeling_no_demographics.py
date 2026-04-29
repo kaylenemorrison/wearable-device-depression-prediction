@@ -17,7 +17,7 @@ groups = physiological_phq8['participant_name']
 
 # Nested cross-validation
 outer_cv = GroupKFold(n_splits=5)
-inner_cv = GroupKFold(n_splits=5)
+inner_cv = GroupKFold(n_splits=3)
 
 test_rmse_scores = []
 test_r2_scores = []
@@ -59,6 +59,10 @@ for train_idx, test_idx in outer_cv.split(X, y, groups):
     
     test_rmse_scores.append(rmse)
     test_r2_scores.append(r2)
+
+# print all test rmse scores and r2 scores
+print(f"Test RMSE scores: {test_rmse_scores}")
+print(f"Test R² scores: {test_r2_scores}")
 
 print(f"Test RMSE: {np.mean(test_rmse_scores):.4f} (+/- {np.std(test_rmse_scores):.4f})")
 print(f"Test R²: {np.mean(test_r2_scores):.4f} (+/- {np.std(test_r2_scores):.4f})")

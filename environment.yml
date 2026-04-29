@@ -1,0 +1,13 @@
+name: thesis
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python
+  - pip
+  - pandas
+  - numpy
+  - scikit-learn
+  - seaborn
+  - matplotlib
