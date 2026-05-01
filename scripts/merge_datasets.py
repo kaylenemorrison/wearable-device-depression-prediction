@@ -2,8 +2,8 @@ import pandas as pd
 
 PATH_TO_PHQ8 = "../data_cleaned/phq8_data.csv"
 PATH_TO_SLEEP = "../data_cleaned/sleep_data.csv"
-#PATH_TO_DEMOGRAPHICS = "../data_cleaned/totaldataset.csv"
-PATH_TO_FINAL_DATASET = "../data_cleaned/physiological_PHQ8.csv"
+PATH_TO_DEMOGRAPHICS = "../data_cleaned/totaldataset.parquet"
+PATH_TO_FINAL_DATASET = "../data_cleaned/final_dataset.parquet"
 
 def create_window(phq8, window_size):
     window = phq8[['participant_name', 'timeInterval_ID']].copy()
@@ -92,7 +92,7 @@ def main():
     # read cleaned datasets; PHQ8 and sleep remain CSVs, demographics is parquet to preserve categorical metadata
     phq8 = pd.read_csv(PATH_TO_PHQ8)
     sleep = pd.read_csv(PATH_TO_SLEEP)
-    #demographics = pd.read_csv(PATH_TO_DEMOGRAPHICS)
+    demographics = pd.read_parquet(PATH_TO_DEMOGRAPHICS)
 
     window_size = 14
     missing_threshold = 7
@@ -101,17 +101,14 @@ def main():
 
     phq8_merged_with_sleep = merge_with_sleep(phq8_missingness_adjusted, sleep, window_size)
 
-    phq8_merged_with_sleep.to_csv(PATH_TO_FINAL_DATASET, index = False)
-
     # merge with demographics
-    # final_dataset = phq8_merged_with_sleep.merge(
-    #     demographics, 
-    #     on = ['participant_name'], 
-    #     how = 'left'
-    #     )
+    final_dataset = phq8_merged_with_sleep.merge(
+         demographics, 
+         on = ['participant_name'], 
+         how = 'left'
+         )
     
-    # write final dataset as parquet to preserve dtype metadata
-    # final_dataset.to_csv(PATH_TO_FINAL_DATASET, index = False)
+    final_dataset.to_parquet(PATH_TO_FINAL_DATASET, engine='pyarrow', index = False)
     
 if __name__ == "__main__":
     main()

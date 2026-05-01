@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 PATH_TO_TOTAL_DATASET = "../data/totaldataset.dta"
-PATH_TO_CLEAN_DATA = "../data_cleaned/totaldataset.csv"
+PATH_TO_CLEAN_DATA = "../data_cleaned/totaldataset.parquet"
 
 demographics = pd.read_stata(PATH_TO_TOTAL_DATASET)
 
@@ -34,7 +34,7 @@ relevant_columns = [
     "eduction_finish_age",
     "drop_school_1",
     #"qualifications",
-    "degree_1",
+    # "degree_1",
     # "benefits_type___0",
     # "benefits_type___1",
     # "benefits_type___2",
@@ -978,43 +978,36 @@ demographics = demographics.drop(columns = ["redcap_event_name"])
 # RECODE ORDINAL VARIABLES TO NUMERIC VALUES
 
 # income_gbp categories: ['Less than £15,000', '£15,000-£24,000', '£24,000-£40,000','£40,000-£55,000', 'More than £55,000']
-demographics["income_gbp"] = demographics["income_gbp"].cat.codes
-demographics["income_gbp"] = demographics["income_gbp"].replace(-1, np.nan)
+""" demographics["income_gbp"] = demographics["income_gbp"].cat.codes
+demographics["income_gbp"] = demographics["income_gbp"].replace(-1, np.nan) """
 
 
 # audit_1 categories: ['Never', 'Monthly or less', '2-4 times a month', '2-3 times a week', '4 or more times a week']
-demographics["audit_1"] = demographics["audit_1"].cat.codes
-demographics["audit_1"] = demographics["audit_1"].replace(-1, np.nan)
+""" demographics["audit_1"] = demographics["audit_1"].cat.codes
+demographics["audit_1"] = demographics["audit_1"].replace(-1, np.nan) """
 
 
 # mh_smoking categories: ['No, I have never smoked','I do not smoke at the moment, but I have smoked in the past', 'Yes']
-demographics["mh_smoking"] = demographics["mh_smoking"].cat.codes
-demographics["mh_smoking"] = demographics["mh_smoking"].replace(-1, np.nan)
+""" demographics["mh_smoking"] = demographics["mh_smoking"].cat.codes
+demographics["mh_smoking"] = demographics["mh_smoking"].replace(-1, np.nan) """
 
 
 # RECODE BOOLEAN VARIABLES TO 0 AND 1
 
 # gender_at_birth categories: ['Female', 'Male']]
-demographics["gender_at_birth"] = demographics["gender_at_birth"].map({"Female": 0, "Male": 1})
-
-# children categories: ['No', 'Yes'
-demographics["children"] = demographics["children"].cat.codes
-demographics["children"] = demographics["children"].replace(-1, np.nan) # replace -1's with NaN's
+""" demographics["gender_at_birth"] = demographics["gender_at_birth"].map({"Female": 0, "Male": 1})
+ """
+# children categories: ['No', 'Yes']
+""" demographics["children"] = demographics["children"].cat.codes
+demographics["children"] = demographics["children"].replace(-1, np.nan) # replace -1's with NaN's """
 
 # drop_school_1 categories: ['No', 'Yes']
-demographics["drop_school_1"] = demographics["drop_school_1"].cat.codes
-demographics["drop_school_1"] = demographics["drop_school_1"].replace(-1, np.nan) # replace -1's with NaN's
+""" demographics["drop_school_1"] = demographics["drop_school_1"].cat.codes
+demographics["drop_school_1"] = demographics["drop_school_1"].replace(-1, np.nan) # replace -1's with NaN's """
 
 # depression_medication categories: ['No', 'Yes']
-demographics["depression_medication"] = demographics["depression_medication"].cat.codes
-demographics["depression_medication"] = demographics["depression_medication"].replace(-1, np.nan) # replace -1's with NaN's
-
-# degree_1 categories: 
-# 1,A-Level or equivalent (HNDs, NVQ level3, Highers)
-# 2,GCSE level or equivalent (O-level, NVQ level 1-2)
-# 3,Below GCSE level
-# 4,Other qualifications
-# 5 No qualifications
+""" demographics["depression_medication"] = demographics["depression_medication"].cat.codes
+demographics["depression_medication"] = demographics["depression_medication"].replace(-1, np.nan) # replace -1's with NaN's """
 
 # final columns = [
     # 'participant_name',          (subject ID)
@@ -1025,7 +1018,6 @@ demographics["depression_medication"] = demographics["depression_medication"].re
     #  'ethnicity_1',              (categorical)
     #  'eduction_finish_age',      (numeric, float64)
     #  'drop_school_1',            (boolean, numeric)
-    #  'degree_1',                 (ordinal, numeric)
     #  'income_gbp',               (ordinal, numeric)
     #  'accommodation',            (categorical)
     #  'mh_smoking',               (ordinal, numeric)
@@ -1033,7 +1025,8 @@ demographics["depression_medication"] = demographics["depression_medication"].re
     #  'depression_medication'     (boolean, numeric)
     #]
 
-demographics.to_csv(PATH_TO_CLEAN_DATA, index = False)
+#demographics.to_csv(PATH_TO_CLEAN_DATA, index = False)
+demographics.to_parquet(PATH_TO_CLEAN_DATA, engine='pyarrow')
 
 # create missing category for categorical variables with missing values (ethnicity_1 and accommodation)
 # impute boolean, numeric, and ordinal variables with missing values 

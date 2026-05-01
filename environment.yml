@@ -6,8 +6,15 @@ channels:
 dependencies:
   - python
   - pip
+  - pip:
+    - MissForest
   - pandas
   - numpy
   - scikit-learn
   - seaborn
   - matplotlib
+  - lightgbm
+  - tqdm
+  - pyarrow
+
+  # update with: conda env update --file environment.yml --prune
