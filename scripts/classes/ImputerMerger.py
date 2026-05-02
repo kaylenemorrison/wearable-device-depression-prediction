@@ -20,7 +20,7 @@ class ImputerMerger(BaseEstimator, TransformerMixin):
         # Will be fitted
         self.imputer_ = None
         
-    def fit(self, X):
+    def fit(self, X,  y=None):
         """Fit MissForest on unique demographic rows"""
         # Extract unique demographic rows (one per participant)
         demo_unique = X.groupby(self.participant_id_col)[self.demographic_cols].first()

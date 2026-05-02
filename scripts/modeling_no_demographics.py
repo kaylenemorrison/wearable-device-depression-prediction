@@ -6,9 +6,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error, r2_score
 import numpy as np
 
-physiological_phq8 = pd.read_csv("../data_cleaned/physiological_PHQ8.csv")
+df = pd.read_parquet("../data_cleaned/final_dataset.parquet")
 
-#  physiological_phq8 columns = ['participant_name', 'timeInterval_ID', 'phq8_score', 'sleep_missing_last14', 'sleep_min', 'sleep_max', 'sleep_mean','sleep_median', 'sleep_std', 'sleep_iqr']
+physiological_phq8 = df[['participant_name', 'timeInterval_ID', 'phq8_score', 'sleep_missing_last14', 'sleep_min', 'sleep_max', 'sleep_mean','sleep_median', 'sleep_std', 'sleep_iqr']]
 
 # Separate features and target
 X = physiological_phq8.drop(columns=['participant_name', 'timeInterval_ID', 'phq8_score'])
@@ -17,7 +17,7 @@ groups = physiological_phq8['participant_name']
 
 # Nested cross-validation
 outer_cv = GroupKFold(n_splits=5)
-inner_cv = GroupKFold(n_splits=3)
+inner_cv = GroupKFold(n_splits=5)
 
 test_rmse_scores = []
 test_r2_scores = []
