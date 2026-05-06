@@ -17,13 +17,13 @@ groups = physiological_phq8['participant_name']
 
 # Nested cross-validation
 outer_cv = GroupKFold(n_splits=5)
-inner_cv = GroupKFold(n_splits=5)
+inner_cv = GroupKFold(n_splits=3)
 
 test_rmse_scores = []
 test_r2_scores = []
 
-alphas = np.logspace(-4, 1, 10)
-l1_ratios = [0.1, 0.3, 0.5, 0.7, 0.9]
+alphas = np.logspace(-4, 1, 20)
+l1_ratios = np.linspace(0.05, 0.95, 10)
 
 param_grid = {
     'elasticnet__alpha': alphas,

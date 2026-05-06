@@ -11,6 +11,8 @@ from classes.ImputerMerger import ImputerMerger
 
 from sklearn.metrics import mean_squared_error, r2_score
 
+from joblib import Memory
+
 import numpy as np
 
 DATA_PATH = "../data_cleaned/final_dataset.parquet"
@@ -31,17 +33,35 @@ def prepare_data(df, categorical_cols, ordinal_cols, boolean_cols):
 
     return X, y, groups
 
+def print_cv_results(fold_params, test_rmse_scores, test_r2_scores):
+    print("\n" + "="*50)
+    print("CROSS-VALIDATION RESULTS")
+    print("="*50)
+
+    print("\nBest parameters in each fold:")
+    for i, params in enumerate(fold_params, 1):
+        print(f"  Fold {i}: {params}")
+
+    print("\nTest metrics per fold:")
+    for i, (rmse, r2) in enumerate(zip(test_rmse_scores, test_r2_scores), 1):
+        print(f"  Fold {i}: RMSE = {rmse:.4f}, R² = {r2:.4f}")
+
+    print("\nSummary:")
+    print(f"  RMSE: {np.mean(test_rmse_scores):.4f} ± {np.std(test_rmse_scores):.4f}")
+    print(f"  R²:   {np.mean(test_r2_scores):.4f} ± {np.std(test_r2_scores):.4f}")
+
+    print("="*50 + "\n")
+
 
 def main():
     df = pd.read_parquet(DATA_PATH)
 
     demographic_cols = [
     'age',
-    'gender_at_birth',
+    'gender',
     'marital_status',
     'children',
     'ethnicity_1',
-    'eduction_finish_age',
     'drop_school_1',
     'income_gbp',
     'accommodation',
@@ -52,9 +72,9 @@ def main():
 
     categorical_cols = ['marital_status', 'ethnicity_1', 'accommodation']
 
-    boolean_cols = ['children', 'drop_school_1', 'depression_medication', 'gender_at_birth']
+    boolean_cols = ['children', 'drop_school_1', 'depression_medication', 'gender']
 
-    numerical_cols = ['eduction_finish_age', 'age']
+    numerical_cols = ['age']
 
     ordinal_cols = ['mh_smoking', 'audit_1', 'income_gbp']
 
@@ -89,6 +109,8 @@ def main():
         verbose_feature_names_out=False 
     ).set_output(transform="pandas")
 
+    memory = Memory(location="cache_dir", verbose=0)
+
     pipeline = Pipeline(steps=[
         ('imputer_merger', ImputerMerger(
             demographic_cols=demographic_cols,
@@ -96,23 +118,29 @@ def main():
         )),
         ('preprocessing', column_processor),
         ('elasticnet', ElasticNet(random_state=42, max_iter=5000))
-    ])
+        ],
+    memory=memory
+    )
 
     outer_cv = GroupKFold(n_splits=5)
-    inner_cv = GroupKFold(n_splits=5)
+    inner_cv = GroupKFold(n_splits=3)
 
     test_rmse_scores = []
     test_r2_scores = []
-
-    alphas = np.logspace(-4, 1, 10)
-    l1_ratios = [0.1, 0.3, 0.5, 0.7, 0.9]
+    fold_params = []
+  
+    alphas = np.logspace(-4, 1, 20)
+    l1_ratios = np.linspace(0.05, 0.95, 10)
 
     param_grid = {
     'elasticnet__alpha': alphas,
     'elasticnet__l1_ratio': l1_ratios
     }
 
-    for train_idx, test_idx in outer_cv.split(X, y, groups):
+
+    for fold_idx, (train_idx, test_idx) in enumerate(outer_cv.split(X, y, groups)):
+        #print(f"Outer Fold {fold_idx}\n")
+
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         groups_train = groups.iloc[train_idx]
@@ -126,7 +154,8 @@ def main():
         
         # Best model
         best_model = grid_search.best_estimator_
-        print(f"Best params for fold: {grid_search.best_params_}")
+        #print(f"Best params for fold: {grid_search.best_params_}")
+        fold_params.append(grid_search.best_params_)
         
         # Evaluate on test set (pipeline includes scaler, so transform X_test)
         y_pred = best_model.predict(X_test)
@@ -136,12 +165,19 @@ def main():
         test_rmse_scores.append(rmse)
         test_r2_scores.append(r2)
 
-    # print all test rmse scores and r2 scores
-    print(f"Test RMSE scores: {test_rmse_scores}")
-    print(f"Test R² scores: {test_r2_scores}")
+    # print best parameters for each fold
+    print_cv_results(fold_params, test_rmse_scores, test_r2_scores)
 
-    print(f"Test RMSE: {np.mean(test_rmse_scores):.4f} (+/- {np.std(test_rmse_scores):.4f})")
-    print(f"Test R²: {np.mean(test_r2_scores):.4f} (+/- {np.std(test_r2_scores):.4f})")
 
 if __name__ == "__main__":
     main()
+
+# question: how important is preventing data leakage for hyperparameter tuning (specifically preventing leakage between train_inner and validate, not between train_outer and test)
+    # imputation
+    # scaling
+
+# cache memory so data isn't re-imputed for a new set of hyperparameters in the inner loop
+
+# reduce number of inner folds to 3
+
+# is it ok to treat ordinal features as continuous 

@@ -1,7 +1,15 @@
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from lightgbm import LGBMClassifier, LGBMRegressor
+
+import os
+os.environ["TQDM_DISABLE"] = "True"
+
 from missforest import MissForest
+import warnings
+
+#warnings.filterwarnings("ignore", category=UserWarning)
 
 class ImputerMerger(BaseEstimator, TransformerMixin):
     """
@@ -27,7 +35,10 @@ class ImputerMerger(BaseEstimator, TransformerMixin):
         
         # Create and fit MissForest imputer
         self.imputer_ = MissForest (
-            categorical=self.categorical_cols
+            clf=LGBMClassifier(n_jobs=1, verbosity=-1),
+            rgr=LGBMRegressor(n_jobs=1, verbosity=-1),
+            categorical=self.categorical_cols,
+            verbose=0
         )
 
         # Fit on demographic data
