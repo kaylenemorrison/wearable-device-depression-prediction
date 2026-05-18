@@ -59,7 +59,7 @@ def main():
     sleep_data.rename(columns={"time_interval": "timeInterval_ID"}, inplace = True)
     sleep_data = sleep_data.merge(time_intervals, on="timeInterval_ID", how="left")
 
-    relevant_columns = ["participant_name", "timeInterval_ID", "date", "total_sleep_time", 
+    relevant_columns = ["participant_name", "timeInterval_ID", "total_sleep_time", 
                          "time_in_bed", 'light_pct', 'deep_pct', 'REM_pct',
                          'awake_pct', 'NREM_pct', 'sleep_onset', 'sleep_offset', 'rem_latency',
                          'sleep_efficiency', 'awakenings', 'insomnia', 'hypersomnia']

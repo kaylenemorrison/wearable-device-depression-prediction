@@ -1,7 +1,7 @@
 import pandas as pd
 
 IN_FILE = "../data/radarV1_MDD/csv_files/dailyFeatures_fitbit_activity.csv"
-OUT_FILE = '../data_cleaned/activity_data.csv'
+OUT_FILE = "../data_cleaned/activity_data.csv"
 
 activity_raw = pd.read_csv(IN_FILE)
 
