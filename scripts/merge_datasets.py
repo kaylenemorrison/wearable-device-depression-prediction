@@ -23,14 +23,24 @@ def create_window(phq8, window_size):
 
 
 def circular_mean(series):
-    """Compute circular mean for time-of-day in hours safely."""
+    """Approximate circular mean for time-of-day in hours."""
     clean_series = series.dropna()
     if clean_series.empty:
         return np.nan
+    
     radians = (clean_series % 24) / 24 * 2 * np.pi
     sin_sum = np.sin(radians).mean()
     cos_sum = np.cos(radians).mean()
-    return (np.arctan2(sin_sum, cos_sum) % (2 * np.pi)) / (2 * np.pi) * 24
+    
+    vector_length = np.sqrt(sin_sum**2 + cos_sum**2)
+    
+    # Check if the vector length is 0 (or practically 0 due to computer precision)
+    if np.isclose(vector_length, 0, atol=1e-5):
+        return np.nan
+    else:
+        mean_angle = np.arctan2(sin_sum, cos_sum) % (2 * np.pi)
+        
+    return (mean_angle / (2 * np.pi)) * 24
 
 
 def circular_std(series):
@@ -38,7 +48,7 @@ def circular_std(series):
     clean_series = series.dropna()
     if clean_series.empty:
         return np.nan
-    radians = (clean_series % 24) / 24 * 2 * np.pi
+    radians = (clean_series % 24)  / 24 * 2 * np.pi
     sin_mean = np.sin(radians).mean()
     cos_mean = np.cos(radians).mean()
     R = np.sqrt(sin_mean**2 + cos_mean**2)
@@ -49,6 +59,8 @@ def circular_std(series):
     val = max(0.0, val)
     return np.sqrt(val) * 24 / (2 * np.pi)
 
+def calculate_sleep_duration(onset, offset, max_val=24):
+    return (offset - onset + max_val) % max_val
 
 def streak_length(series):
     """Max consecutive run of 1s."""
@@ -117,14 +129,12 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     time_in_bed_agg = time_in_bed_agg.reset_index().merge(time_in_bed_custom, on=group_cols, how="left")
 
-
     """ sleep stage composition features """
     sleep_stage_cols = ["light_pct", "deep_pct", "REM_pct", "awake_pct", "NREM_pct"]
     sleep_stage_funcs = ["min", "max", "mean", "median", "std"]
     sleep_stage_agg = window.groupby(group_cols)[sleep_stage_cols].agg(sleep_stage_funcs)
     sleep_stage_agg.columns = [f"{col}_{stat}" for col, stat in sleep_stage_agg.columns]
 
-    # Pre-calculate ratios row-by-row to completely avoid slow/unstable `.apply(lambda g: ...)`
     window['rem_deep_ratio'] = window["REM_pct"] / window["deep_pct"].replace(0, np.nan)
     window['light_restorative_ratio'] = window["light_pct"] / (window["deep_pct"] + window["REM_pct"]).replace(0, np.nan)
 
@@ -138,7 +148,6 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     sleep_stage_agg = sleep_stage_agg.reset_index().merge(sleep_stage_custom, on=group_cols, how="left")
 
-
     """ sleep_onset / sleep_offset """
     sleep_timing_cols = ["sleep_onset", "sleep_offset"]
     sleep_timing_agg = window.groupby(group_cols)[sleep_timing_cols].agg(["min", "max"])
@@ -146,8 +155,8 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     sleep_timing_agg = sleep_timing_agg.reset_index()
 
     # Pre-calculate midpoints and timing differences row-wise
-    window['time_in_bed_diff'] = window["sleep_offset"] - window["sleep_onset"]
-    window['sleep_midpoint'] = (window["sleep_onset"] + window["sleep_offset"]) / 2
+    window['time_in_bed_diff'] = calculate_sleep_duration(window["sleep_onset"], window["sleep_offset"])
+    window['sleep_midpoint'] = (window["sleep_onset"] + ( window['time_in_bed_diff'] / 2)) % 24
 
     sleep_timing_custom = (
         window.groupby(group_cols)
@@ -164,7 +173,6 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     sleep_timing_custom['sleep_phase_instability'] = sleep_timing_custom['sleep_onset_std'] + sleep_timing_custom['sleep_offset_std']
     sleep_timing_agg = sleep_timing_agg.merge(sleep_timing_custom, on=group_cols, how="left")
-
 
     """ rem_latency """
     funcs_rem_latency = ["min", "max", "mean", "median", "std", "sum"]
@@ -183,7 +191,6 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
         .reset_index()
     )
     rem_latency_agg = rem_latency_agg.merge(rem_latency_custom, on=group_cols, how="left")
-
 
     """ awakenings """
     funcs_awakenings = ["min", "max", "mean", "median", "std", "sum"]
@@ -204,7 +211,6 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
         .reset_index()
     )
     awakenings_agg = awakenings_agg.merge(awakenings_custom, on=group_cols, how="left")
-
 
     """ insomnia / hypersomnia """
     binary_cols = ["insomnia", "hypersomnia"]
@@ -230,7 +236,6 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
         .reset_index()
     )
     disorder_agg = disorder_agg.merge(disorder_custom, on=group_cols, how="left")
-
 
     # Master Merge
     agg_list = [
