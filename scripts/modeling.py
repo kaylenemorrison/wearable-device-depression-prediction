@@ -5,47 +5,114 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import ElasticNet
-from sklearn.model_selection import GroupKFold, GridSearchCV
-
-from classes.ImputerMerger import ImputerMerger
-
 from sklearn.metrics import mean_squared_error, r2_score
-
-from joblib import Memory
-
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import (
+    cross_val_score,
+    GroupKFold
+)
+from sklearn.base import clone
+import optuna
+from optuna.samplers import TPESampler
 import numpy as np
+import os
+#os.environ["TQDM_DISABLE"] = "True"
+import warnings
 
+SEED = 42
 DATA_PATH = "../data_cleaned/final_dataset.parquet"
 
-def prepare_data(df, categorical_cols, ordinal_cols, boolean_cols):
+def prepare_data(df, categorical_cols, boolean_cols):
     df_new = df.drop(columns = ["timeInterval_ID"])
-
-    X = df_new.drop(columns=['phq8_score'])
+    X = df_new.drop(columns=['phq8_score', 'participant_name'])
     y = df_new['phq8_score']
     groups = df_new['participant_name']
-
-    cols_to_encode = categorical_cols + ordinal_cols + boolean_cols
-
+    cols_to_encode = categorical_cols + boolean_cols
     for col in cols_to_encode:
         X[col] = X[col].cat.codes
         X[col] = X[col].replace(-1, np.nan)
-
+        X[col] = X[col].astype('category')
     return X, y, groups
 
-def get_oh_encoder(all_cat_cols, X):
+def get_oh_encoder(all_cat_cols, X_global):
     categorical_cols_dict = {
-        col: sorted(X[col].dropna().unique().tolist())
+        col: sorted(X_global[col].dropna().unique().tolist())
         for col in all_cat_cols
     }
-
     categories_list = list(categorical_cols_dict.values())
-
     oh_encoder = OneHotEncoder(
         categories=categories_list,
         sparse_output=False,
+    )
+    return oh_encoder
+
+def create_pipeline(X_global, categorical_cols, boolean_cols, numerical_cols):
+
+    oh_encoder = get_oh_encoder(categorical_cols, X_global)
+
+    # numeric pipeline
+    numeric_pipeline = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    # categorical pipeline
+    categorical_pipeline = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", oh_encoder)
+    ])
+
+    # boolean pipeline
+    boolean_pipeline = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, numerical_cols),
+            ("cat", categorical_pipeline, categorical_cols),
+            ("bool", boolean_pipeline, boolean_cols),
+        ],
+        verbose_feature_names_out=False
     ).set_output(transform="pandas")
 
-    return oh_encoder
+    pipeline = Pipeline(steps=[
+        ("preprocessing", preprocessor),
+        ("elasticnet", ElasticNet(random_state=42, max_iter=20000))
+    ])
+
+    return pipeline
+
+def run_optuna_search(X_global, X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40):
+    base_pipeline = create_pipeline(categorical_cols, all_boolean_cols, numerical_cols)
+    def objective(trial):
+        alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
+        l1_ratio = trial.suggest_float("l1_ratio", 0.05, 0.95)
+
+        pipeline = clone(base_pipeline)
+
+        pipeline.set_params(
+            elasticnet__alpha=alpha,
+            elasticnet__l1_ratio=l1_ratio
+        )
+
+        neg_mses = cross_val_score(
+            pipeline, X, y,
+            cv=gkf,                     # stratified cross validiation
+            groups = groups,
+            scoring="neg_mean_squared_error", # MSE
+            n_jobs=-1,                  # parallelize
+        )
+        return (-1) * neg_mses.mean()
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=TPESampler(seed=SEED),
+        study_name="depression_elastic_net_tuning",
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    return study
 
 def print_cv_results(fold_params, test_rmse_scores, test_r2_scores):
     print("\n" + "="*50)
@@ -66,67 +133,59 @@ def print_cv_results(fold_params, test_rmse_scores, test_r2_scores):
 
     print("="*50 + "\n")
 
-
 def main():
     df = pd.read_parquet(DATA_PATH)
 
+    df["any_disorder"] = df["any_disorder"].astype('category')
+
     demographic_cols = [
-    'age',
-    'gender',
-    'marital_status',
-    'children',
-    'ethnicity_1',
-    'drop_school_1',
-    'income_gbp',
-    'accommodation',
-    'mh_smoking',
-    'audit_1',
-    'depression_medication'
+        'age',
+        'gender',
+        'marital_status',
+        'children',
+        'ethnicity_1',
+        'drop_school_1',
+        'accommodation',
+        'mh_smoking',
+        'audit_1',
+        'depression_medication'
     ]
 
-    categorical_cols = ['marital_status', 'ethnicity_1', 'accommodation']
+    categorical_cols = [
+        'marital_status',
+        'ethnicity_1',
+        'accommodation',
+        'mh_smoking',
+        'audit_1',
+    ]
 
-    boolean_cols = ['children', 'drop_school_1', 'depression_medication', 'gender']
+    boolean_cols_demographics = [
+        'children',
+        'drop_school_1',
+        'depression_medication',
+        'gender'
+    ]
+
+    boolean_cols_sleep = [
+        'any_disorder'
+    ]
+
+    all_boolean_cols = boolean_cols_demographics + boolean_cols_sleep
 
     numerical_cols = ['age']
 
-    numerical_cols += [col for col in df.columns if col.startswith('sleep')]
+    group_cols = ['participant_name', 'timeInterval_ID']
 
-    ordinal_cols = ['mh_smoking', 'audit_1', 'income_gbp']
+    outcome_col = ['phq8_score']
+        
+    cols_to_exclude_numerical = demographic_cols + boolean_cols_sleep + group_cols + outcome_col
 
-    X, y, groups = prepare_data(df, categorical_cols, ordinal_cols, boolean_cols)
+    numerical_cols += [
+        col for col in df.columns
+        if col not in cols_to_exclude_numerical
+    ]
 
-    all_cat_cols = categorical_cols + boolean_cols
-
-    oh_encoder = get_oh_encoder(all_cat_cols, X)
-
-    column_processor = ColumnTransformer(
-        transformers=[
-            # One-Hot Encode Categorical and Boolean columns
-            ('cat', oh_encoder, all_cat_cols),
-            
-            # Scale Numerical and Ordinal columns
-            ('num', StandardScaler(), numerical_cols + ordinal_cols),
-            
-            # Explicitly drop the participant_name now that merging is done
-            ('drop_id', 'drop', ['participant_name'])
-        ],
-        remainder='passthrough',
-        verbose_feature_names_out=False 
-    ).set_output(transform="pandas")
-
-    memory = Memory(location="cache_dir", verbose=0)
-
-    pipeline = Pipeline(steps=[
-        ('imputer_merger', ImputerMerger(
-            demographic_cols=demographic_cols,
-            categorical_cols=categorical_cols + boolean_cols
-        )),
-        ('preprocessing', column_processor),
-        ('elasticnet', ElasticNet(random_state=42, max_iter=20000))
-        ],
-    memory=memory
-    )
+    X, y, groups = prepare_data(df, categorical_cols, boolean_cols_demographics)
 
     outer_cv = GroupKFold(n_splits=5)
     inner_cv = GroupKFold(n_splits=3)
@@ -135,44 +194,47 @@ def main():
     test_r2_scores = []
     fold_params = []
 
-    alphas = np.logspace(-4, 1, 20)
-    l1_ratios = np.linspace(0.05, 0.95, 10)
+    for fold_idx, (train_idx, test_idx) in enumerate(
+        outer_cv.split(X, y, groups), 1
+    ):
 
-    param_grid = {
-    'elasticnet__alpha': alphas,
-    'elasticnet__l1_ratio': l1_ratios
-    }
-
-    for train_idx, test_idx in outer_cv.split(X, y, groups):
-        #print(f"Outer Fold {fold_idx}\n")
+        print(f"\nStarting outer fold {fold_idx}")
 
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
         groups_train = groups.iloc[train_idx]
-        
-        # Precompute inner CV splits respecting groups
-        inner_cv_splits = list(inner_cv.split(X_train, y_train, groups_train))
-        
-        # Hyperparameter tuning with GridSearchCV on precomputed inner folds
-        grid_search = GridSearchCV(pipeline, param_grid, cv=inner_cv_splits, scoring='neg_mean_squared_error', n_jobs=-1,)
-        grid_search.fit(X_train, y_train)  # Note: no pre-scaling, pipeline handles it
-        
-        # Best model
-        best_model = grid_search.best_estimator_
-        #print(f"Best params for fold: {grid_search.best_params_}")
-        fold_params.append(grid_search.best_params_)
-        
-        # Evaluate on test set (pipeline includes scaler, so transform X_test)
+
+        study = run_optuna_search(X, X_train, y_train, inner_cv, groups_train, categorical_cols, all_boolean_cols, numerical_cols)
+
+        best_params = study.best_params
+
+        print(f"Best params: {best_params}")
+
+        fold_params.append(best_params)
+
+        best_model = create_pipeline(X, categorical_cols, all_boolean_cols, numerical_cols)
+
+        best_model.set_params(
+            elasticnet__alpha=best_params["alpha"],
+            elasticnet__l1_ratio=best_params["l1_ratio"]
+        )
+
+        best_model.fit(X_train, y_train)
+
         y_pred = best_model.predict(X_test)
+
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2 = r2_score(y_test, y_pred)
-        
+
         test_rmse_scores.append(rmse)
         test_r2_scores.append(r2)
 
-    # print best parameters for each fold
-    print_cv_results(fold_params, test_rmse_scores, test_r2_scores)
-
+    print_cv_results(
+        fold_params,
+        test_rmse_scores,
+        test_r2_scores
+    )
 
 if __name__ == "__main__":
     main()

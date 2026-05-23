@@ -101,6 +101,7 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
 
     group_cols = ['participant_name', 'timeInterval_ID']
 
+    
     """ total_sleep_time """
     funcs_total_sleep_time = ['min', 'max', 'mean', 'median', 'std', 'sum']
     total_sleep_time_agg = window.groupby(group_cols)[["total_sleep_time"]].agg(funcs_total_sleep_time)
@@ -129,6 +130,7 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     time_in_bed_agg = time_in_bed_agg.reset_index().merge(time_in_bed_custom, on=group_cols, how="left")
 
+    
     """ sleep stage composition features """
     sleep_stage_cols = ["light_pct", "deep_pct", "REM_pct", "awake_pct", "NREM_pct"]
     sleep_stage_funcs = ["min", "max", "mean", "median", "std"]
@@ -148,6 +150,7 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     sleep_stage_agg = sleep_stage_agg.reset_index().merge(sleep_stage_custom, on=group_cols, how="left")
 
+    
     """ sleep_onset / sleep_offset """
     sleep_timing_cols = ["sleep_onset", "sleep_offset"]
     sleep_timing_agg = window.groupby(group_cols)[sleep_timing_cols].agg(["min", "max"])
@@ -174,6 +177,7 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     sleep_timing_custom['sleep_phase_instability'] = sleep_timing_custom['sleep_onset_std'] + sleep_timing_custom['sleep_offset_std']
     sleep_timing_agg = sleep_timing_agg.merge(sleep_timing_custom, on=group_cols, how="left")
 
+    
     """ rem_latency """
     funcs_rem_latency = ["min", "max", "mean", "median", "std", "sum"]
     rem_latency_agg = window.groupby(group_cols)[["rem_latency"]].agg(funcs_rem_latency)
@@ -192,6 +196,7 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     rem_latency_agg = rem_latency_agg.merge(rem_latency_custom, on=group_cols, how="left")
 
+    
     """ awakenings """
     funcs_awakenings = ["min", "max", "mean", "median", "std", "sum"]
     awakenings_agg = window.groupby(group_cols)[["awakenings"]].agg(funcs_awakenings)
@@ -212,6 +217,7 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
     )
     awakenings_agg = awakenings_agg.merge(awakenings_custom, on=group_cols, how="left")
 
+    
     """ insomnia / hypersomnia """
     binary_cols = ["insomnia", "hypersomnia"]
     funcs_binary = ["sum", "mean", "max"]
@@ -280,13 +286,19 @@ def main():
 
     phq8_merged_with_sleep = merge_with_sleep(phq8, sleep, window_size, missing_threshold)
 
+    # Calculate missingness rate for each column
+    missingness_rate = phq8_merged_with_sleep.isnull().mean()
+
+    # Keep only columns with 40% or less missingness
+    phq8_merged_with_sleep = phq8_merged_with_sleep.loc[:, missingness_rate <= 0.40]
+
     # merge with demographics
     final_dataset = phq8_merged_with_sleep.merge(
          demographics, 
          on = ['participant_name'], 
          how = 'left'
          )
-    
+        
     final_dataset.to_parquet(PATH_TO_FINAL_DATASET, engine='pyarrow', index = False)
     
 if __name__ == "__main__":
