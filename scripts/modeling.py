@@ -5,7 +5,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import ElasticNet
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import matplotlib.pyplot as plt
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import (
     cross_val_score,
@@ -84,7 +85,7 @@ def create_pipeline(X_global, categorical_cols, boolean_cols, numerical_cols):
     return pipeline
 
 def run_optuna_search(X_global, X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40):
-    base_pipeline = create_pipeline(categorical_cols, all_boolean_cols, numerical_cols)
+    base_pipeline = create_pipeline(X_global, categorical_cols, all_boolean_cols, numerical_cols)
     def objective(trial):
         alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
         l1_ratio = trial.suggest_float("l1_ratio", 0.05, 0.95)
@@ -98,7 +99,7 @@ def run_optuna_search(X_global, X, y, gkf, groups, categorical_cols, all_boolean
 
         neg_mses = cross_val_score(
             pipeline, X, y,
-            cv=gkf,                     # stratified cross validiation
+            cv=gkf,                     # grouped cross validiation
             groups = groups,
             scoring="neg_mean_squared_error", # MSE
             n_jobs=-1,                  # parallelize
@@ -114,7 +115,7 @@ def run_optuna_search(X_global, X, y, gkf, groups, categorical_cols, all_boolean
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return study
 
-def print_cv_results(fold_params, test_rmse_scores, test_r2_scores):
+def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_scores):
     print("\n" + "="*50)
     print("CROSS-VALIDATION RESULTS")
     print("="*50)
@@ -124,14 +125,69 @@ def print_cv_results(fold_params, test_rmse_scores, test_r2_scores):
         print(f"  Fold {i}: {params}")
 
     print("\nTest metrics per fold:")
-    for i, (rmse, r2) in enumerate(zip(test_rmse_scores, test_r2_scores), 1):
-        print(f"  Fold {i}: RMSE = {rmse:.4f}, R² = {r2:.4f}")
+    for i, (rmse, mae, r2) in enumerate(zip(test_rmse_scores, test_mae_scores, test_r2_scores), 1):
+        print(f"  Fold {i}: RMSE = {rmse:.4f}, MAE = {mae:.4f}, R² = {r2:.4f}")
 
     print("\nSummary:")
     print(f"  RMSE: {np.mean(test_rmse_scores):.4f} ± {np.std(test_rmse_scores):.4f}")
+    print(f"  MAE:  {np.mean(test_mae_scores):.4f} ± {np.std(test_mae_scores):.4f}")
     print(f"  R²:   {np.mean(test_r2_scores):.4f} ± {np.std(test_r2_scores):.4f}")
+    
 
     print("="*50 + "\n")
+
+def plot_calibration(y_true, y_pred, title="Calibration: Actual vs Predicted"):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    # Metrics
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+
+    # Calibration regression: actual ~ alpha + beta * predicted
+    beta, alpha = np.polyfit(y_pred, y_true, 1)   # note: order is (x, y) = (pred, true)
+
+    # Calibration-in-the-large: mean(actual) - mean(predicted)
+    # (the intercept you'd get if beta were fixed at 1)
+    cil = y_true.mean() - y_pred.mean()
+
+    # Shared plot bounds so the diagonal is a true 45 degrees
+    lo = min(y_true.min(), y_pred.min())
+    hi = max(y_true.max(), y_pred.max())
+    pad = (hi - lo) * 0.05
+    lims = np.array([lo - pad, hi + pad])
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(y_pred, y_true, alpha=0.5, edgecolor="k", linewidth=0.3)
+
+    # Perfect-calibration diagonal (actual = predicted)
+    ax.plot(lims, lims, "--", color="gray", label="Perfect calibration")
+
+    # Fitted calibration line: actual = alpha + beta * predicted
+    ax.plot(lims, beta * lims + alpha, color="red",
+            label=f"Calibration fit (α={alpha:.3f}, β={beta:.2f})")
+
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Predicted")          # x-axis predicted
+    ax.set_ylabel("Actual")             # y-axis actual
+    ax.set_title(title)
+    ax.legend(loc="upper left")
+
+    # Metrics box
+    txt = (f"α (intercept) = {alpha:.3f}\n"
+           f"β (slope)     = {beta:.3f}\n"
+           f"CIL           = {cil:.3f}\n"
+           f"R² = {r2:.3f}   RMSE = {rmse:.3f}   MAE = {mae:.3f}")
+    ax.text(0.97, 0.03, txt, transform=ax.transAxes,
+            ha="right", va="bottom", family="monospace",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+    plt.show()
+    return {"alpha": alpha, "beta": beta, "cil": cil, "r2": r2, "rmse": rmse, "mae": mae}
 
 def main():
     df = pd.read_parquet(DATA_PATH)
@@ -192,7 +248,10 @@ def main():
 
     test_rmse_scores = []
     test_r2_scores = []
+    test_mae_scores = []
     fold_params = []
+    y_true_all = []
+    y_pred_all = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(
         outer_cv.split(X, y, groups), 1
@@ -223,17 +282,24 @@ def main():
         best_model.fit(X_train, y_train)
 
         y_pred = best_model.predict(X_test)
+        y_true_all.extend(y_test)
+        y_pred_all.extend(y_pred)
 
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2 = r2_score(y_test, y_pred)
+        mae = mean_absolute_error(y_test, y_pred)
 
         test_rmse_scores.append(rmse)
         test_r2_scores.append(r2)
+        test_mae_scores.append(mae)
+
+    plot_calibration(y_true_all, y_pred_all)
 
     print_cv_results(
         fold_params,
         test_rmse_scores,
-        test_r2_scores
+        test_r2_scores,
+        test_mae_scores
     )
 
 if __name__ == "__main__":
