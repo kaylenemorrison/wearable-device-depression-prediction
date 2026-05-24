@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 from functools import reduce
 
-
 PATH_TO_PHQ8 = "../data_cleaned/phq8_data.csv"
 PATH_TO_SLEEP = "../data_cleaned/sleep_data.csv"
 PATH_TO_DEMOGRAPHICS = "../data_cleaned/totaldataset.parquet"
@@ -63,17 +62,23 @@ def calculate_sleep_duration(onset, offset, max_val=24):
     return (offset - onset + max_val) % max_val
 
 def streak_length(series):
-    """Max consecutive run of 1s."""
-    clean_arr = series.dropna().values
-    if len(clean_arr) == 0:
+    """Max consecutive run of 1s.
+ 
+    A missing day (NaN) breaks the streak: it is treated as a reset rather than
+    being dropped, so e.g. [1, NaN, 1] yields a max streak of 1, not 2.
+    Returns NaN only if the window contains no observed values at all.
+    """
+    arr = series.values
+    if series.dropna().empty:
         return np.nan
     max_streak = 0
     current = 0
-    for v in clean_arr:
+    for v in arr:
         if v == 1:
             current += 1
             max_streak = max(max_streak, current)
         else:
+            # NaN (missing day) or any non-1 value resets the streak
             current = 0
     return max_streak
 
@@ -188,8 +193,8 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
         window.groupby(group_cols)["rem_latency"]
         .agg(
             rem_latency_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan,
-            rem_latency_pct_high=lambda x: (x > 2).mean(),
-            rem_latency_pct_very_high=lambda x: (x > 3).mean(),
+            rem_latency_pct_high=lambda x: (x.dropna() > 2).mean(),
+            rem_latency_pct_very_high=lambda x: (x.dropna() > 3).mean(),
             rem_latency_range=lambda x: x.max() - x.min(),
         )
         .reset_index()
@@ -207,9 +212,9 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
         window.groupby(group_cols)["awakenings"]
         .agg(
             awakenings_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan,
-            awakenings_pct_any=lambda x: (x > 0).mean(),
-            awakenings_pct_mod=lambda x: (x >= 2).mean(),
-            awakenings_pct_high=lambda x: (x >= 3).mean(),
+            awakenings_pct_any=lambda x: (x.dropna() > 0).mean(),
+            awakenings_pct_mod=lambda x: (x.dropna() >= 2).mean(),
+            awakenings_pct_high=lambda x: (x.dropna() >= 3).mean(),
             awakenings_worst_night=lambda x: x.max(),
             awakenings_range=lambda x: x.max() - x.min(),
         )
