@@ -304,6 +304,7 @@ def main():
          how = 'left'
          )
         
+    final_dataset = final_dataset.drop(columns=["timeInterval_ID"])
     final_dataset.to_parquet(PATH_TO_FINAL_DATASET, engine='pyarrow', index = False)
     
 if __name__ == "__main__":
