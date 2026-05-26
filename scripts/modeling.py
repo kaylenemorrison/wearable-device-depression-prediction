@@ -152,58 +152,6 @@ def run_optuna_search_simple_imputation_elastic_net(X_global, X, y, gkf, groups,
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study
 
-def run_optuna_search_simple_imputation_lasso(X_global, X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40):
-    base_pipeline = create_elastic_net_pipeline(X_global, categorical_cols, all_boolean_cols, numerical_cols)
-    def objective(trial):
-        alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
-        pipeline = clone(base_pipeline)
-        pipeline.set_params(elasticnet__alpha=alpha, elasticnet__l1_ratio=1.0)
-        neg_mses = cross_val_score(
-            pipeline, X, y,
-            cv=gkf,
-            groups=groups,
-            scoring="neg_mean_squared_error",
-            n_jobs=-1,
-        )
-        return (-1) * neg_mses.mean()
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=TPESampler(seed=SEED),
-        study_name="depression_lasso_tuning_simple_imputation",
-    )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    return study
-
-
-def run_optuna_search_miceforest_imputation_lasso(X_global, cached_folds, categorical_cols,
-                      all_boolean_cols, numerical_cols, n_trials=40):
-    base_pipeline = create_elastic_net_pipeline(
-        X_global, categorical_cols, all_boolean_cols, numerical_cols
-    )
-
-    def objective(trial):
-        alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
-        fold_mses = []
-        for fold in cached_folds:
-            pipeline = clone(base_pipeline)
-            pipeline.set_params(elasticnet__alpha=alpha, elasticnet__l1_ratio=1.0)
-            pipeline.fit(fold["X_train"], fold["y_train"])
-            pred = pipeline.predict(fold["X_val"])
-            fold_mses.append(mean_squared_error(fold["y_val"], pred))
-        return np.mean(fold_mses)
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=TPESampler(seed=SEED),
-        study_name="depression_lasso_tuning_miceforest_imputation",
-    )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    return study
-
-
 def run_optuna_search_miceforest_imputation_elastic_net(X_global, cached_folds, categorical_cols,
                       all_boolean_cols, numerical_cols, n_trials=40):
     base_pipeline = create_elastic_net_pipeline(
@@ -353,7 +301,7 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        choices=["elastic_net", "lasso", "xgboost"],
+        choices=["elastic_net", "xgboost"],
         default="elastic_net",
         help="Predictive model. Default: elastic_net.",
     )
@@ -531,53 +479,6 @@ def main(args):
                 best_model.fit(X_train_imp, y_train)
                 y_pred = best_model.predict(X_test_imp)
 
-        elif args.model == "lasso":
-
-            if args.imputation == "simple":
-                study = run_optuna_search_simple_imputation_lasso(
-                    X, X_train, y_train, inner_cv, groups_train,
-                    categorical_cols, all_boolean_cols, numerical_cols
-                )
-                best_params = study.best_params
-
-                best_model = create_elastic_net_pipeline(
-                    X, categorical_cols, all_boolean_cols, numerical_cols
-                )
-                best_model.set_params(
-                    elasticnet__alpha=best_params["alpha"],
-                    elasticnet__l1_ratio=1.0,
-                )
-                best_model.fit(X_train, y_train)
-                y_pred = best_model.predict(X_test)
-
-            elif args.imputation == "miceforest":
-                cached_folds = impute_inner_folds(
-                    X_train, y_train, groups_train, inner_cv, iterations=3
-                )
-                study = run_optuna_search_miceforest_imputation_lasso(
-                    X, cached_folds, categorical_cols,
-                    all_boolean_cols, numerical_cols
-                )
-                best_params = study.best_params
-
-                final_kernel = mf.ImputationKernel(
-                    data=X_train, num_datasets=1, random_state=SEED,
-                    mean_match_strategy="fast",
-                )
-                final_kernel.mice(iterations=3)
-                X_train_imp = final_kernel.complete_data(dataset=0)
-                X_test_imp = final_kernel.impute_new_data(X_test).complete_data(dataset=0)
-
-                best_model = create_elastic_net_pipeline(
-                    X, categorical_cols, all_boolean_cols, numerical_cols
-                )
-                best_model.set_params(
-                    elasticnet__alpha=best_params["alpha"],
-                    elasticnet__l1_ratio=1.0,
-                )
-                best_model.fit(X_train_imp, y_train)
-                y_pred = best_model.predict(X_test_imp)
-
         elif args.model == "xgboost":
             # TODO: implement XGBoost path (own Optuna search + pipeline).
             raise NotImplementedError("XGBoost path not implemented yet.")
@@ -654,51 +555,6 @@ def main(args):
             final_model.set_params(
                 elasticnet__alpha=final_best_params["alpha"],
                 elasticnet__l1_ratio=final_best_params["l1_ratio"],
-            )
-            final_model.fit(X_imp, y)
-
-    elif args.model == "lasso":
-        if args.imputation == "simple":
-            final_study = run_optuna_search_simple_imputation_lasso(
-                X, X, y, final_cv, groups,
-                categorical_cols, all_boolean_cols, numerical_cols,
-            )
-            final_best_params = final_study.best_params
-            print(f"  Best params: {final_best_params}")
-
-            final_model = create_elastic_net_pipeline(
-                X, categorical_cols, all_boolean_cols, numerical_cols
-            )
-            final_model.set_params(
-                elasticnet__alpha=final_best_params["alpha"],
-                elasticnet__l1_ratio=1.0,
-            )
-            final_model.fit(X, y)
-
-        elif args.imputation == "miceforest":
-            final_cached_folds = impute_inner_folds(
-                X, y, groups, final_cv, iterations=3
-            )
-            final_study = run_optuna_search_miceforest_imputation_lasso(
-                X, final_cached_folds, categorical_cols,
-                all_boolean_cols, numerical_cols,
-            )
-            final_best_params = final_study.best_params
-            print(f"  Best params: {final_best_params}")
-
-            final_kernel = mf.ImputationKernel(
-                data=X, num_datasets=1, random_state=SEED,
-                mean_match_strategy="fast",
-            )
-            final_kernel.mice(iterations=3)
-            X_imp = final_kernel.complete_data(dataset=0)
-
-            final_model = create_elastic_net_pipeline(
-                X, categorical_cols, all_boolean_cols, numerical_cols
-            )
-            final_model.set_params(
-                elasticnet__alpha=final_best_params["alpha"],
-                elasticnet__l1_ratio=1.0,
             )
             final_model.fit(X_imp, y)
 
