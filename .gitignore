@@ -2,6 +2,9 @@
 data/
 data_cleaned/
 
+# --- Untracked Scratch Notebooks ---
+scratch_untracked/
+
 # --- Jupyter Notebooks ---
 .ipynb_checkpoints/
 
