@@ -18,12 +18,12 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+import xgboost as xgb
 
 # os.environ["TQDM_DISABLE"] = "True"
 
 SEED = 42
 DATA_PATH = "../data_cleaned/final_dataset.parquet"
-
 
 def prepare_data(df, categorical_cols, boolean_cols):
     df_new = df.copy()
@@ -42,6 +42,28 @@ def prepare_data(df, categorical_cols, boolean_cols):
         X[col] = X[col].cat.codes
         X[col] = X[col].replace(-1, np.nan)
         X[col] = X[col].astype('category')
+    return X, y, groups
+
+def prepare_data_xgboost(df, categorical_cols, boolean_cols):
+    # Keeps original string category labels so XGBoost (enable_categorical=True)
+    # treats these columns as unordered nominal — no cat.codes applied.
+    # Inconsistency vs elastic net: XGBoost fits on X_train only, so a category
+    # level that appears exclusively in participants assigned to the test fold is
+    # unseen at train time and gets routed to the missing/default branch at
+    # predict time. Elastic net avoids this because its OHE is fitted on global X
+    # (see get_oh_encoder). 
+    df_new = df.copy()
+    df_new["ethnicity_1"] = (
+        df_new["ethnicity_1"].astype("object")
+        .where(df_new["ethnicity_1"].notna(), "Unknown")
+        .astype("category")
+    )
+    X = df_new.drop(columns=['phq8_score', 'participant_name'])
+    y = df_new['phq8_score']
+    groups = df_new['participant_name']
+    for col in categorical_cols + boolean_cols:
+        if X[col].dtype.name != 'category':
+            X[col] = X[col].astype('category')
     return X, y, groups
 
 def impute_inner_folds(X_train, y_train, groups_train, inner_cv, iterations=3):
@@ -81,6 +103,12 @@ def impute_inner_folds(X_train, y_train, groups_train, inner_cv, iterations=3):
     return cached_folds
 
 def get_oh_encoder(all_cat_cols, X_global):
+    # OHE is fitted on global X (full dataset), not X_train, so all category
+    # levels are always known regardless of which participants land in each fold.
+    # A rare level absent from X_train still gets a column; ElasticNet learns a
+    # (regularisation-shrunk) coefficient for it. Contrast with XGBoost, where
+    # a level unseen in X_train is routed to the missing/default branch at
+    # predict time (see prepare_data_xgboost).
     categorical_cols_dict = {
         col: sorted(X_global[col].dropna().unique().tolist())
         for col in all_cat_cols
@@ -149,7 +177,7 @@ def run_optuna_search_simple_imputation_elastic_net(X_global, X, y, gkf, groups,
         sampler=TPESampler(seed=SEED),
         study_name="depression_elastic_net_tuning_simple_imputation",
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return study
 
 def run_optuna_search_miceforest_imputation_elastic_net(X_global, cached_folds, categorical_cols,
@@ -180,23 +208,68 @@ def run_optuna_search_miceforest_imputation_elastic_net(X_global, cached_folds, 
         sampler=TPESampler(seed=SEED),
         study_name="depression_elastic_net_tuning_miceforest_imputation",
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return study
 
-def print_model_summary(model, best_params):
-    feature_names = model.named_steps["preprocessing"].get_feature_names_out()
-    coefs = model.named_steps["elasticnet"].coef_
-    coef_df = pd.DataFrame({"feature": feature_names, "coefficient": coefs})
-    coef_df["abs_coef"] = coef_df["coefficient"].abs()
-    coef_df = coef_df.sort_values("abs_coef", ascending=False).drop(columns="abs_coef")
+def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=40):
+    def objective(trial):
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 1500, step=100),
+            "learning_rate":    trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "max_depth":        trial.suggest_int("max_depth", 3, 8),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 1e-3, 10, log=True),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
+            "gamma":            trial.suggest_float("gamma", 0.0, 2.0),
+        }
 
-    print(f"\n  alpha:     {best_params['alpha']:.6f}")
-    if "l1_ratio" in best_params:
-        print(f"  l1_ratio:  {best_params['l1_ratio']:.6f}")
-    print(f"\n  {'Feature':<45} Coefficient")
-    print("  " + "-" * 60)
-    for _, row in coef_df.iterrows():
-        print(f"  {row['feature']:<45} {row['coefficient']:>10.6f}")
+        model = xgb.XGBRegressor(
+            enable_categorical=True,
+            objective="reg:squarederror",
+            random_state=SEED,
+            n_jobs=1,
+            **params,
+        )
+
+        neg_mses = cross_val_score(
+            model, X, y,
+            cv=gkf,
+            groups=groups,
+            scoring="neg_mean_squared_error",
+            n_jobs=-1,
+        )
+        return (-1) * neg_mses.mean()
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=TPESampler(seed=SEED),
+        study_name="depression_xgb_tuning",
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    return study
+
+def print_model_summary(model_type, model, best_params):
+    if model_type == "elastic_net":
+        feature_names = model.named_steps["preprocessing"].get_feature_names_out()
+        coefs = model.named_steps["elasticnet"].coef_
+        coef_df = pd.DataFrame({"feature": feature_names, "coefficient": coefs})
+        coef_df["abs_coef"] = coef_df["coefficient"].abs()
+        coef_df = coef_df.sort_values("abs_coef", ascending=False).drop(columns="abs_coef")
+
+        print(f"\n  alpha:     {best_params['alpha']:.6f}")
+        if "l1_ratio" in best_params:
+            print(f"  l1_ratio:  {best_params['l1_ratio']:.6f}")
+        print(f"\n  {'Feature':<45} Coefficient")
+        print("  " + "-" * 60)
+        for _, row in coef_df.iterrows():
+            print(f"  {row['feature']:<45} {row['coefficient']:>10.6f}")
+    elif model_type == "xgboost":
+        print("\n  Hyperparameters:")
+        for k, v in best_params.items():
+            print(f"    {k:<30} {v}")
 
 
 def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_scores):
@@ -216,8 +289,6 @@ def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_sco
     print(f"  RMSE: {np.mean(test_rmse_scores):.4f} ± {np.std(test_rmse_scores):.4f}")
     print(f"  MAE:  {np.mean(test_mae_scores):.4f} ± {np.std(test_mae_scores):.4f}")
     print(f"  R²:   {np.mean(test_r2_scores):.4f} ± {np.std(test_r2_scores):.4f}")
-    
-
     print("="*50 + "\n")
 
 def plot_calibration(y_true, y_pred, run_tag, title="Calibration: Actual vs Predicted"):
@@ -389,7 +460,10 @@ def main(args):
         if col not in cols_to_exclude_numerical
     ]
 
-    X, y, groups = prepare_data(df, categorical_cols, boolean_cols_demographics)
+    if args.model == "xgboost":
+        X, y, groups = prepare_data_xgboost(df, categorical_cols, all_boolean_cols)
+    else:
+        X, y, groups = prepare_data(df, categorical_cols, boolean_cols_demographics)
 
     if args.feature_set == "demographics":
         X = X[demographic_cols]
@@ -480,8 +554,19 @@ def main(args):
                 y_pred = best_model.predict(X_test_imp)
 
         elif args.model == "xgboost":
-            # TODO: implement XGBoost path (own Optuna search + pipeline).
-            raise NotImplementedError("XGBoost path not implemented yet.")
+            study = run_optuna_search_xgboost(X_train, y_train, inner_cv, groups_train, n_trials=40)
+            best_params = study.best_params
+
+            best_model = xgb.XGBRegressor(
+                enable_categorical = True, 
+                objective="reg:squarederror",
+                random_state=SEED,
+                **best_params
+            )
+
+            best_model.fit(X_train, y_train)
+            y_pred = best_model.predict(X_test)
+
 
         fold_params.append(best_params)
 
@@ -558,7 +643,19 @@ def main(args):
             )
             final_model.fit(X_imp, y)
 
-    print_model_summary(final_model, final_best_params)
+    elif args.model == "xgboost":
+        final_study = run_optuna_search_xgboost(X, y, final_cv, groups, n_trials=40)
+        final_best_params = final_study.best_params
+        print(f"  Best params: {final_best_params}")
+        final_model = xgb.XGBRegressor(
+            enable_categorical=True,
+            objective="reg:squarederror",
+            random_state=SEED,
+            **final_best_params
+        )
+        final_model.fit(X, y)
+
+    print_model_summary(args.model, final_model, final_best_params)
     print("\n" + "="*50)
 
 if __name__ == "__main__":

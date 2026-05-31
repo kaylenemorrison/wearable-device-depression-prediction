@@ -16,6 +16,7 @@ dependencies:
   - seaborn
   - matplotlib
   - lightgbm
+  - xgboost=2.1
   - tqdm
   - pyarrow
 
