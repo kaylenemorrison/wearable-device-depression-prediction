@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import numpy as np
 from functools import reduce
@@ -5,7 +6,6 @@ from functools import reduce
 PATH_TO_PHQ8 = "../data_cleaned/phq8_data.csv"
 PATH_TO_SLEEP = "../data_cleaned/sleep_data.csv"
 PATH_TO_DEMOGRAPHICS = "../data_cleaned/totaldataset.parquet"
-PATH_TO_FINAL_DATASET = "../data_cleaned/final_dataset.parquet"
 
 SIX_HOURS_SECONDS = 6 * 60 * 60
 
@@ -280,14 +280,51 @@ def merge_with_sleep(phq8, sleep, window_size, missing_threshold):
 
     return phq8_with_sleep_stats
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Wearable device data feature aggregation."
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        choices=[3, 5, 7, 14],
+        default=14,
+        help="Window size for the aggregated features. Default: 14.",
+    )
+    parser.add_argument(
+        "--missing-threshold",
+        type=int,
+        default=None,
+        help=(
+            "Max missing days allowed before nulling a window. "
+            "Must be between ceil(window_size/2) and window_size (inclusive). "
+            "Defaults to ceil(window_size/2)."
+        ),
+    )
+    args = parser.parse_args()
+
+    lower = (args.window_size + 1) // 2
+    upper = args.window_size
+    if args.missing_threshold is None:
+        args.missing_threshold = lower
+    elif not (lower <= args.missing_threshold <= upper):
+        parser.error(
+            f"--missing-threshold must be between {lower} and {upper} "
+            f"for --window-size {args.window_size} (got {args.missing_threshold})"
+        )
+
+    return args
+
 def main():
+    args = parse_args()
+
     # read cleaned datasets; PHQ8 and sleep remain CSVs, demographics is parquet to preserve categorical metadata
     phq8 = pd.read_csv(PATH_TO_PHQ8)
     sleep = pd.read_csv(PATH_TO_SLEEP)
     demographics = pd.read_parquet(PATH_TO_DEMOGRAPHICS)
 
-    window_size = 14
-    missing_threshold = 7
+    window_size = args.window_size
+    missing_threshold = args.missing_threshold
 
     phq8_merged_with_sleep = merge_with_sleep(phq8, sleep, window_size, missing_threshold)
 
@@ -305,7 +342,8 @@ def main():
          )
         
     final_dataset = final_dataset.drop(columns=["timeInterval_ID"])
-    final_dataset.to_parquet(PATH_TO_FINAL_DATASET, engine='pyarrow', index = False)
+    output_path = f"../data_cleaned/final_dataset_w{window_size}.parquet"
+    final_dataset.to_parquet(output_path, engine='pyarrow', index = False)
     
 if __name__ == "__main__":
     main()

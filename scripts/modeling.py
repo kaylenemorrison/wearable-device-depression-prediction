@@ -23,7 +23,6 @@ import xgboost as xgb
 # os.environ["TQDM_DISABLE"] = "True"
 
 SEED = 42
-DATA_PATH = "../data_cleaned/final_dataset.parquet"
 
 def prepare_data(df, categorical_cols, boolean_cols):
     df_new = df.copy()
@@ -405,9 +404,10 @@ def main(args):
     print(f"  Model:        {args.model}")
     print("="*50)
 
-    df = pd.read_parquet(DATA_PATH)
+    data_path = f"../data_cleaned/final_dataset_w{args.window_size}.parquet"
+    df = pd.read_parquet(data_path)
 
-    print("\nColumns in final_dataset.parquet:")
+    print(f"\nColumns in final_dataset_w{args.window_size}.parquet:")
     for col in df.columns:
         print(f"  {col}")
 
@@ -472,7 +472,7 @@ def main(args):
     elif args.feature_set == "simple_aggregations":
         pass  # all aggregated sleep/activity features + demographics
     elif args.feature_set == "catch22":
-        raise NotImplementedError("catch22 features not yet in final_dataset.parquet.")
+        raise NotImplementedError("catch22 features not yet implemented.")
 
     outer_cv = GroupKFold(n_splits=5)
     inner_cv = GroupKFold(n_splits=3)
