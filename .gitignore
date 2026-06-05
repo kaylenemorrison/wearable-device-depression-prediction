@@ -1,6 +1,7 @@
 # --- Data Files ---
 data/
 data_cleaned/
+data_merged/
 
 # --- Results ---
 results/

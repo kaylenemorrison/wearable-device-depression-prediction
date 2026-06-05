@@ -46,11 +46,12 @@ def prepare_data(df, categorical_cols, boolean_cols):
 def prepare_data_xgboost(df, categorical_cols, boolean_cols):
     # Keeps original string category labels so XGBoost (enable_categorical=True)
     # treats these columns as unordered nominal — no cat.codes applied.
-    # Inconsistency vs elastic net: XGBoost fits on X_train only, so a category
-    # level that appears exclusively in participants assigned to the test fold is
-    # unseen at train time and gets routed to the missing/default branch at
-    # predict time. Elastic net avoids this because its OHE is fitted on global X
-    # (see get_oh_encoder). 
+    # XGBoost fits on X_train only, so a category level that appears exclusively
+    # in participants assigned to the test fold is unseen at train time and gets
+    # routed to the missing/default branch at predict time. Elastic net now
+    # behaves consistently: its OHE is fitted per fold on train only, with
+    # handle_unknown="ignore" zeroing out a test-only level
+    # (see create_elastic_net_pipeline).
     df_new = df.copy()
     df_new["ethnicity_1"] = (
         df_new["ethnicity_1"].astype("object")
@@ -101,34 +102,14 @@ def impute_inner_folds(X_train, y_train, groups_train, inner_cv, iterations=3):
         })
     return cached_folds
 
-def get_oh_encoder(all_cat_cols, X_global):
-    # OHE is fitted on global X (full dataset), not X_train, so all category
-    # levels are always known regardless of which participants land in each fold.
-    # A rare level absent from X_train still gets a column; ElasticNet learns a
-    # (regularisation-shrunk) coefficient for it. Contrast with XGBoost, where
-    # a level unseen in X_train is routed to the missing/default branch at
-    # predict time (see prepare_data_xgboost).
-    categorical_cols_dict = {
-        col: sorted(X_global[col].dropna().unique().tolist())
-        for col in all_cat_cols
-    }
-    categories_list = list(categorical_cols_dict.values())
-    oh_encoder = OneHotEncoder(
-        categories=categories_list,
-        sparse_output=False,
-    )
-    return oh_encoder
-
-def create_elastic_net_pipeline(X_global, categorical_cols, boolean_cols, numerical_cols):
-    oh_encoder = get_oh_encoder(categorical_cols, X_global)
-
+def create_elastic_net_pipeline(categorical_cols, boolean_cols, numerical_cols):
     numeric_pipeline = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
     ])
     categorical_pipeline = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", oh_encoder),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)), # OHE infers categories from the data it is fitted on
     ])
     boolean_pipeline = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
@@ -148,8 +129,8 @@ def create_elastic_net_pipeline(X_global, categorical_cols, boolean_cols, numeri
         ("elasticnet", ElasticNet(random_state=42, max_iter=20000)),
     ])
 
-def run_optuna_search_simple_imputation_elastic_net(X_global, X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40):
-    base_pipeline = create_elastic_net_pipeline(X_global, categorical_cols, all_boolean_cols, numerical_cols)
+def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40):
+    base_pipeline = create_elastic_net_pipeline(categorical_cols, all_boolean_cols, numerical_cols)
     def objective(trial):
         alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
         l1_ratio = trial.suggest_float("l1_ratio", 0.05, 0.95)
@@ -179,10 +160,10 @@ def run_optuna_search_simple_imputation_elastic_net(X_global, X, y, gkf, groups,
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return study
 
-def run_optuna_search_miceforest_imputation_elastic_net(X_global, cached_folds, categorical_cols,
+def run_optuna_search_miceforest_imputation_elastic_net(cached_folds, categorical_cols,
                       all_boolean_cols, numerical_cols, n_trials=40):
     base_pipeline = create_elastic_net_pipeline(
-        X_global, categorical_cols, all_boolean_cols, numerical_cols
+        categorical_cols, all_boolean_cols, numerical_cols
     )
 
     def objective(trial):
@@ -404,7 +385,7 @@ def main(args):
     print(f"  Model:        {args.model}")
     print("="*50)
 
-    data_path = f"../data_cleaned/final_dataset_w{args.window_size}.parquet"
+    data_path = f"../data_merged/final_dataset_w{args.window_size}.parquet"
     df = pd.read_parquet(data_path)
 
     print(f"\nColumns in final_dataset_w{args.window_size}.parquet:")
@@ -508,13 +489,13 @@ def main(args):
             if args.imputation == "simple":
                 # imputation happens inside the pipeline, per trial
                 study = run_optuna_search_simple_imputation_elastic_net(
-                    X, X_train, y_train, inner_cv, groups_train,
+                    X_train, y_train, inner_cv, groups_train,
                     categorical_cols, all_boolean_cols, numerical_cols
                 )
                 best_params = study.best_params
 
                 best_model = create_elastic_net_pipeline(
-                    X, categorical_cols, all_boolean_cols, numerical_cols
+                    categorical_cols, all_boolean_cols, numerical_cols
                 )
                 best_model.set_params(
                     elasticnet__alpha=best_params["alpha"],
@@ -529,7 +510,7 @@ def main(args):
                     X_train, y_train, groups_train, inner_cv, iterations=3
                 )
                 study = run_optuna_search_miceforest_imputation_elastic_net(
-                    X, cached_folds, categorical_cols,
+                    cached_folds, categorical_cols,
                     all_boolean_cols, numerical_cols
                 )
                 best_params = study.best_params
@@ -537,14 +518,14 @@ def main(args):
                 # impute outer train/test for the final fold model
                 final_kernel = mf.ImputationKernel(
                     data=X_train, num_datasets=1, random_state=SEED,
-                    mean_match_strategy="fast", 
+                    mean_match_strategy="fast",
                 )
                 final_kernel.mice(iterations=3)
                 X_train_imp = final_kernel.complete_data(dataset=0)
                 X_test_imp = final_kernel.impute_new_data(X_test).complete_data(dataset=0)
 
                 best_model = create_elastic_net_pipeline(
-                    X, categorical_cols, all_boolean_cols, numerical_cols
+                    categorical_cols, all_boolean_cols, numerical_cols
                 )
                 best_model.set_params(
                     elasticnet__alpha=best_params["alpha"],
@@ -601,14 +582,14 @@ def main(args):
     if args.model == "elastic_net":
         if args.imputation == "simple":
             final_study = run_optuna_search_simple_imputation_elastic_net(
-                X, X, y, final_cv, groups,
+                X, y, final_cv, groups,
                 categorical_cols, all_boolean_cols, numerical_cols,
             )
             final_best_params = final_study.best_params
             print(f"  Best params: {final_best_params}")
 
             final_model = create_elastic_net_pipeline(
-                X, categorical_cols, all_boolean_cols, numerical_cols
+                categorical_cols, all_boolean_cols, numerical_cols
             )
             final_model.set_params(
                 elasticnet__alpha=final_best_params["alpha"],
@@ -621,7 +602,7 @@ def main(args):
                 X, y, groups, final_cv, iterations=3
             )
             final_study = run_optuna_search_miceforest_imputation_elastic_net(
-                X, final_cached_folds, categorical_cols,
+                final_cached_folds, categorical_cols,
                 all_boolean_cols, numerical_cols,
             )
             final_best_params = final_study.best_params
@@ -635,7 +616,7 @@ def main(args):
             X_imp = final_kernel.complete_data(dataset=0)
 
             final_model = create_elastic_net_pipeline(
-                X, categorical_cols, all_boolean_cols, numerical_cols
+                categorical_cols, all_boolean_cols, numerical_cols
             )
             final_model.set_params(
                 elasticnet__alpha=final_best_params["alpha"],

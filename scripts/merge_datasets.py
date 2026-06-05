@@ -1,4 +1,5 @@
 import argparse
+import os
 import pandas as pd
 import numpy as np
 from functools import reduce
@@ -6,6 +7,7 @@ from functools import reduce
 PATH_TO_PHQ8 = "../data_cleaned/phq8_data.csv"
 PATH_TO_SLEEP = "../data_cleaned/sleep_data.csv"
 PATH_TO_DEMOGRAPHICS = "../data_cleaned/totaldataset.parquet"
+PATH_TO_MERGED = "../data_merged"
 
 SIX_HOURS_SECONDS = 6 * 60 * 60
 
@@ -342,7 +344,8 @@ def main():
          )
         
     final_dataset = final_dataset.drop(columns=["timeInterval_ID"])
-    output_path = f"../data_cleaned/final_dataset_w{window_size}.parquet"
+    os.makedirs(PATH_TO_MERGED, exist_ok=True)
+    output_path = f"{PATH_TO_MERGED}/final_dataset_w{window_size}.parquet"
     final_dataset.to_parquet(output_path, engine='pyarrow', index = False)
     
 if __name__ == "__main__":
