@@ -5,10 +5,11 @@ import warnings
 from datetime import datetime
 
 import matplotlib.pyplot as plt
-import miceforest as mf
 import numpy as np
 import optuna
 import pandas as pd
+from lightgbm import LGBMClassifier, LGBMRegressor
+from missforest import MissForest
 from optuna.samplers import TPESampler
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
@@ -24,35 +25,22 @@ import xgboost as xgb
 
 SEED = 42
 
-def prepare_data(df, categorical_cols, boolean_cols):
-    df_new = df.copy()
-    # Make missing ethnicity an explicit 'Unknown' category before cat.codes
-    # encoding so miceforest doesn't impute it (missingness is informative).
-    df_new["ethnicity_1"] = (
-        df_new["ethnicity_1"].astype("object")
-        .where(df_new["ethnicity_1"].notna(), "Unknown")
-        .astype("category")
-    )
-    X = df_new.drop(columns=['phq8_score', 'participant_name'])
-    y = df_new['phq8_score']
-    groups = df_new['participant_name']
-    cols_to_encode = categorical_cols + boolean_cols
-    for col in cols_to_encode:
-        X[col] = X[col].cat.codes
-        X[col] = X[col].replace(-1, np.nan)
-        X[col] = X[col].astype('category')
-    return X, y, groups
+def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
+    """Split df into (X, y, groups) and encode the categorical/boolean columns.
 
-def prepare_data_xgboost(df, categorical_cols, boolean_cols):
-    # Keeps original string category labels so XGBoost (enable_categorical=True)
-    # treats these columns as unordered nominal — no cat.codes applied.
-    # XGBoost fits on X_train only, so a category level that appears exclusively
-    # in participants assigned to the test fold is unseen at train time and gets
-    # routed to the missing/default branch at predict time. Elastic net now
-    # behaves consistently: its OHE is fitted per fold on train only, with
-    # handle_unknown="ignore" zeroing out a test-only level
-    # (see create_elastic_net_pipeline).
+    encode_as_codes=True (elastic net + MissForest): cat.codes -> integer codes
+    carried as 'category' dtype. MissForest requires int/float/bool input
+    (`missforest_impute` casts these codes to Int64), and the OHE consumes them
+    fine. encode_as_codes=False (XGBoost, enable_categorical=True): keep the
+    original labels as 'category' dtype so they are treated as unordered nominal
+    — no cat.codes. XGBoost fits on X_train only, so a level appearing only in
+    test-fold participants is unseen at train time and routed to the
+    missing/default branch at predict; the elastic-net OHE behaves consistently
+    via handle_unknown="ignore" (see create_elastic_net_pipeline).
+    """
     df_new = df.copy()
+    # Make missing ethnicity an explicit 'Unknown' category before encoding so
+    # the imputer doesn't impute it (missingness is informative).
     df_new["ethnicity_1"] = (
         df_new["ethnicity_1"].astype("object")
         .where(df_new["ethnicity_1"].notna(), "Unknown")
@@ -62,38 +50,65 @@ def prepare_data_xgboost(df, categorical_cols, boolean_cols):
     y = df_new['phq8_score']
     groups = df_new['participant_name']
     for col in categorical_cols + boolean_cols:
-        if X[col].dtype.name != 'category':
+        if encode_as_codes:
+            X[col] = X[col].cat.codes
+            X[col] = X[col].replace(-1, np.nan)
+            X[col] = X[col].astype('category')
+        elif X[col].dtype.name != 'category':
             X[col] = X[col].astype('category')
     return X, y, groups
 
-def impute_inner_folds(X_train, y_train, groups_train, inner_cv, iterations=3):
+def missforest_impute(X_train, X_test, categorical_features, max_iter=3):
+    """Leakage-free MissForest imputation: fit on train only, apply to test.
+
+    missforest 4.x accepts only int/float/bool columns, so the integer-coded
+    categorical columns (cat.codes / 0-1 flags, carried as 'category' dtype)
+    are cast to nullable Int64 on the way in. The imputer's output is returned
+    as-is (categoricals come back as Int64): the elastic-net pipeline's
+    OneHotEncoder and boolean passthrough consume those integer codes directly,
+    so no dtype restore is needed (and casting back to 'category' here would
+    actually break the OneHotEncoder). A LGBMClassifier is used for the
+    categorical columns and a LGBMRegressor for the numeric ones.
+    Returns X_train_imp, or (X_train_imp, X_test_imp) when X_test is given."""
+    imputer = MissForest(
+        clf=LGBMClassifier(linear_tree=True, verbosity=-1, random_state=SEED),
+        rgr=LGBMRegressor(linear_tree=True, verbosity=-1, random_state=SEED),
+        categorical=categorical_features,
+        max_iter=max_iter,
+        verbose=0,
+    )
+
+    def _to_input(X):
+        X = X.copy()
+        for col in categorical_features:
+            X[col] = X[col].astype("Int64")
+        return X
+
+    X_train_imp = imputer.fit_transform(_to_input(X_train))
+    if X_test is None:
+        return X_train_imp
+    X_test_imp = imputer.transform(_to_input(X_test))
+    return X_train_imp, X_test_imp
+
+def impute_inner_folds(X_train, y_train, groups_train, inner_cv,
+                       categorical_features, iterations=3):
     """Precompute leakage-free imputed (train, val) pairs for each inner fold.
-    Kernel is fit only on inner-train; inner-val is imputed via impute_new_data.
+    MissForest is fit only on inner-train; inner-val is imputed via transform.
     Returns a list of dicts, one per inner fold."""
     cached_folds = []
     for inner_train_idx, inner_val_idx in inner_cv.split(X_train, y_train, groups_train):
-        # miceforest's ImputationKernel asserts a RangeIndex on the input, but
-        # .iloc[...] preserves the original (non-contiguous) labels. Reset the
-        # index on every slice so the kernel accepts the data AND so X/y stay
-        # positionally aligned after complete_data() returns a fresh RangeIndex.
+        # .iloc[...] preserves the original (non-contiguous) labels; reset the
+        # index on every slice so X/y stay positionally aligned with the
+        # imputer output and downstream indexing.
         X_itr = X_train.iloc[inner_train_idx].reset_index(drop=True)
         X_ival = X_train.iloc[inner_val_idx].reset_index(drop=True)
         y_itr = y_train.iloc[inner_train_idx].reset_index(drop=True)
         y_ival = y_train.iloc[inner_val_idx].reset_index(drop=True)
- 
-        # "fast" skips the log-odds transform, so 0/1 LightGBM probabilities
-        # on rare categorical levels don't produce inf/nan in mean-matching.
-        kernel = mf.ImputationKernel(
-            data=X_itr,
-            num_datasets=1,
-            random_state=SEED,
-            mean_match_strategy="fast",
+
+        X_itr_imp, X_ival_imp = missforest_impute(
+            X_itr, X_ival, categorical_features, max_iter=iterations
         )
-        kernel.mice(iterations=iterations)
- 
-        X_itr_imp = kernel.complete_data(dataset=0)
-        X_ival_imp = kernel.impute_new_data(X_ival).complete_data(dataset=0)
- 
+
         cached_folds.append({
             "X_train": X_itr_imp,
             "y_train": y_itr,
@@ -102,24 +117,37 @@ def impute_inner_folds(X_train, y_train, groups_train, inner_cv, iterations=3):
         })
     return cached_folds
 
-def create_elastic_net_pipeline(categorical_cols, boolean_cols, numerical_cols):
-    numeric_pipeline = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    categorical_pipeline = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)), # OHE infers categories from the data it is fitted on
-    ])
-    boolean_pipeline = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-    ])
+def create_elastic_net_pipeline(categorical_cols, boolean_cols, numerical_cols,
+                                include_imputers=True):
+    # include_imputers=False drops the in-pipeline SimpleImputers, used when the
+    # input is already complete (imputed upstream by MissForest) so they would
+    # only be no-ops. The `simple` strategy keeps them True: it has no upstream
+    # imputation, so the SimpleImputers ARE the imputation (fit per Optuna trial).
+    numeric_steps = []
+    categorical_steps = []
+    if include_imputers:
+        numeric_steps.append(("imputer", SimpleImputer(strategy="median")))
+        categorical_steps.append(("imputer", SimpleImputer(strategy="most_frequent")))
+    numeric_steps.append(("scaler", StandardScaler()))
+    # OHE infers categories from the data it is fitted on
+    categorical_steps.append(
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    )
+
+    numeric_pipeline = Pipeline(steps=numeric_steps)
+    categorical_pipeline = Pipeline(steps=categorical_steps)
+    # The boolean branch only ever held an imputer; with none needed, the
+    # integer-coded columns pass straight through.
+    boolean_transformer = (
+        Pipeline(steps=[("imputer", SimpleImputer(strategy="most_frequent"))])
+        if include_imputers else "passthrough"
+    )
 
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", numeric_pipeline, numerical_cols),
             ("cat", categorical_pipeline, categorical_cols),
-            ("bool", boolean_pipeline, boolean_cols),
+            ("bool", boolean_transformer, boolean_cols),
         ],
         verbose_feature_names_out=False,
     ).set_output(transform="pandas")
@@ -160,10 +188,10 @@ def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categoric
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return study
 
-def run_optuna_search_miceforest_imputation_elastic_net(cached_folds, categorical_cols,
+def run_optuna_search_missforest_imputation_elastic_net(cached_folds, categorical_cols,
                       all_boolean_cols, numerical_cols, n_trials=40):
     base_pipeline = create_elastic_net_pipeline(
-        categorical_cols, all_boolean_cols, numerical_cols
+        categorical_cols, all_boolean_cols, numerical_cols, include_imputers=False
     )
 
     def objective(trial):
@@ -186,26 +214,28 @@ def run_optuna_search_miceforest_imputation_elastic_net(cached_folds, categorica
     study = optuna.create_study(
         direction="minimize",
         sampler=TPESampler(seed=SEED),
-        study_name="depression_elastic_net_tuning_miceforest_imputation",
+        study_name="depression_elastic_net_tuning_missforest_imputation",
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return study
 
-def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=40):
+def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=80):
     def objective(trial):
         params = {
             "n_estimators":     trial.suggest_int("n_estimators", 200, 1500, step=100),
-            "learning_rate":    trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "learning_rate":    trial.suggest_float("learning_rate", 1e-2, 0.3, log=True),
             "max_depth":        trial.suggest_int("max_depth", 3, 8),
             "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
             "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
             "reg_alpha":        trial.suggest_float("reg_alpha", 1e-3, 10, log=True),
             "reg_lambda":       trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
-            "gamma":            trial.suggest_float("gamma", 0.0, 2.0),
+            "max_cat_to_onehot": trial.suggest_int("max_cat_to_onehot", 1, 10),
+            "max_cat_threshold": trial.suggest_int("max_cat_threshold", 8, 64),
         }
 
         model = xgb.XGBRegressor(
+            tree_method="hist",  # histogram-based approximate splits; required for enable_categorical
             enable_categorical=True,
             objective="reg:squarederror",
             random_state=SEED,
@@ -346,7 +376,7 @@ def parse_args():
     )
     parser.add_argument(
         "--imputation",
-        choices=["simple", "miceforest"],
+        choices=["simple", "missforest"],
         default="simple",
         help="Imputation strategy. Ignored when --model xgboost. Default: simple.",
     )
@@ -442,7 +472,9 @@ def main(args):
     ]
 
     if args.model == "xgboost":
-        X, y, groups = prepare_data_xgboost(df, categorical_cols, all_boolean_cols)
+        # native categoricals: keep original labels, no cat.codes
+        X, y, groups = prepare_data(df, categorical_cols, all_boolean_cols,
+                                    encode_as_codes=False)
     else:
         X, y, groups = prepare_data(df, categorical_cols, boolean_cols_demographics)
 
@@ -454,6 +486,12 @@ def main(args):
         pass  # all aggregated sleep/activity features + demographics
     elif args.feature_set == "catch22":
         raise NotImplementedError("catch22 features not yet implemented.")
+
+    # Columns MissForest must treat as classification targets: the integer-coded
+    # category-dtype columns emitted by prepare_data (cat.codes categoricals +
+    # 0/1 flags). Derived after feature-set subsetting so e.g. any_disorder is
+    # excluded when it isn't present.
+    categorical_features = X.select_dtypes(include="category").columns.tolist()
 
     outer_cv = GroupKFold(n_splits=5)
     inner_cv = GroupKFold(n_splits=3)
@@ -474,9 +512,8 @@ def main(args):
 
         groups_train = groups.iloc[train_idx]
 
-        # Reset indices once so any downstream miceforest kernels accept the
-        # data (RangeIndex assertion) and X/y remain positionally aligned with
-        # the fresh RangeIndex that complete_data() returns.
+        # Reset indices once so X/y remain positionally aligned with the
+        # imputer output and any downstream positional indexing.
         X_train = X_train.reset_index(drop=True)
         X_test = X_test.reset_index(drop=True)
         y_train = y_train.reset_index(drop=True)
@@ -504,28 +541,27 @@ def main(args):
                 best_model.fit(X_train, y_train)
                 y_pred = best_model.predict(X_test)
 
-            elif args.imputation == "miceforest":
+            elif args.imputation == "missforest":
                 # impute each inner fold once (leakage-free), search over cache
                 cached_folds = impute_inner_folds(
-                    X_train, y_train, groups_train, inner_cv, iterations=3
+                    X_train, y_train, groups_train, inner_cv,
+                    categorical_features, iterations=3
                 )
-                study = run_optuna_search_miceforest_imputation_elastic_net(
+                study = run_optuna_search_missforest_imputation_elastic_net(
                     cached_folds, categorical_cols,
                     all_boolean_cols, numerical_cols
                 )
                 best_params = study.best_params
 
-                # impute outer train/test for the final fold model
-                final_kernel = mf.ImputationKernel(
-                    data=X_train, num_datasets=1, random_state=SEED,
-                    mean_match_strategy="fast",
+                # impute outer train/test for the final fold model (fit on
+                # outer-train only, applied to outer-test)
+                X_train_imp, X_test_imp = missforest_impute(
+                    X_train, X_test, categorical_features, max_iter=3
                 )
-                final_kernel.mice(iterations=3)
-                X_train_imp = final_kernel.complete_data(dataset=0)
-                X_test_imp = final_kernel.impute_new_data(X_test).complete_data(dataset=0)
 
                 best_model = create_elastic_net_pipeline(
-                    categorical_cols, all_boolean_cols, numerical_cols
+                    categorical_cols, all_boolean_cols, numerical_cols,
+                    include_imputers=False
                 )
                 best_model.set_params(
                     elasticnet__alpha=best_params["alpha"],
@@ -535,11 +571,12 @@ def main(args):
                 y_pred = best_model.predict(X_test_imp)
 
         elif args.model == "xgboost":
-            study = run_optuna_search_xgboost(X_train, y_train, inner_cv, groups_train, n_trials=40)
+            study = run_optuna_search_xgboost(X_train, y_train, inner_cv, groups_train)
             best_params = study.best_params
 
             best_model = xgb.XGBRegressor(
-                enable_categorical = True, 
+                tree_method="hist",  # histogram-based approximate splits; required for enable_categorical
+                enable_categorical = True,
                 objective="reg:squarederror",
                 random_state=SEED,
                 **best_params
@@ -597,26 +634,22 @@ def main(args):
             )
             final_model.fit(X, y)
 
-        elif args.imputation == "miceforest":
+        elif args.imputation == "missforest":
             final_cached_folds = impute_inner_folds(
-                X, y, groups, final_cv, iterations=3
+                X, y, groups, final_cv, categorical_features, iterations=3
             )
-            final_study = run_optuna_search_miceforest_imputation_elastic_net(
+            final_study = run_optuna_search_missforest_imputation_elastic_net(
                 final_cached_folds, categorical_cols,
                 all_boolean_cols, numerical_cols,
             )
             final_best_params = final_study.best_params
             print(f"  Best params: {final_best_params}")
 
-            final_kernel = mf.ImputationKernel(
-                data=X, num_datasets=1, random_state=SEED,
-                mean_match_strategy="fast",
-            )
-            final_kernel.mice(iterations=3)
-            X_imp = final_kernel.complete_data(dataset=0)
+            X_imp = missforest_impute(X, None, categorical_features, max_iter=3)
 
             final_model = create_elastic_net_pipeline(
-                categorical_cols, all_boolean_cols, numerical_cols
+                categorical_cols, all_boolean_cols, numerical_cols,
+                include_imputers=False
             )
             final_model.set_params(
                 elasticnet__alpha=final_best_params["alpha"],
@@ -625,10 +658,11 @@ def main(args):
             final_model.fit(X_imp, y)
 
     elif args.model == "xgboost":
-        final_study = run_optuna_search_xgboost(X, y, final_cv, groups, n_trials=40)
+        final_study = run_optuna_search_xgboost(X, y, final_cv, groups)
         final_best_params = final_study.best_params
         print(f"  Best params: {final_best_params}")
         final_model = xgb.XGBRegressor(
+            tree_method="hist",  # histogram-based approximate splits; required for enable_categorical
             enable_categorical=True,
             objective="reg:squarederror",
             random_state=SEED,
