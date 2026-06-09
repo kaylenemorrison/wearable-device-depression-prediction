@@ -98,7 +98,7 @@ def run():
     for n in LENGTHS:
         for shape in SHAPES:
             for _ in range(TRIALS_PER_SHAPE):
-                x = list(map(float, make_series(shape, n)))
+                x = list(map(float, make_series(shape, n))) # pycatch22 wants lists, not numpy arrays
                 for func_name, label in FEATURES:
                     fn = getattr(pycatch22, func_name)
                     try:
@@ -113,7 +113,7 @@ def run():
     def classify(vals):
         arr = np.asarray(vals, dtype=float)
         total = arr.size
-        bad = np.sum(~np.isfinite(arr))
+        bad = np.sum(~np.isfinite(arr)) # count of NaN/inf
         finite = arr[np.isfinite(arr)]
         bad_rate = bad / total
         if bad_rate > 0:
