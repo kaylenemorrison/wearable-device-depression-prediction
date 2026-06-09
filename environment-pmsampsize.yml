@@ -1,0 +1,18 @@
+# Standalone environment for the Riley et al. (2020) prediction-model sample
+# size calculation (scripts/pmsampsize_feature_count.py).
+#
+# Kept separate from environment.yml because the pmsampsize pip package pins
+# pandas<3, which conflicts with the pandas 3.x used by the main pipeline.
+#
+# Create with:   conda env create -f environment-pmsampsize.yml
+# Update with:   conda env update --file environment-pmsampsize.yml --prune
+# Run a script:  conda run -n pmsampsize python scripts/pmsampsize_feature_count.py
+
+name: pmsampsize
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.12
+  - pip
+  - pip:
+    - pmsampsize
