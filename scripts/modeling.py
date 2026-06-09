@@ -39,13 +39,6 @@ def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
     via handle_unknown="ignore" (see create_elastic_net_pipeline).
     """
     df_new = df.copy()
-    # Make missing ethnicity an explicit 'Unknown' category before encoding so
-    # the imputer doesn't impute it (missingness is informative).
-    df_new["ethnicity_1"] = (
-        df_new["ethnicity_1"].astype("object")
-        .where(df_new["ethnicity_1"].notna(), "Unknown")
-        .astype("category")
-    )
     X = df_new.drop(columns=['phq8_score', 'participant_name'])
     y = df_new['phq8_score']
     groups = df_new['participant_name']
