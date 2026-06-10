@@ -275,7 +275,8 @@ def print_model_summary(model_type, model, best_params):
             print(f"    {k:<30} {v}")
 
 
-def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_scores):
+def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_scores,
+                     train_r2_scores):
     print("\n" + "="*50)
     print("CROSS-VALIDATION RESULTS")
     print("="*50)
@@ -288,10 +289,21 @@ def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_sco
     for i, (rmse, mae, r2) in enumerate(zip(test_rmse_scores, test_mae_scores, test_r2_scores), 1):
         print(f"  Fold {i}: RMSE = {rmse:.4f}, MAE = {mae:.4f}, R² = {r2:.4f}")
 
+    # Overfitting check: apparent (train) R² vs held-out (test) R². The optimism
+    # is their difference; a large positive gap means the model is fitting noise.
+    print("\nOverfitting check (apparent vs held-out R² per fold):")
+    optimism = []
+    for i, (tr, te) in enumerate(zip(train_r2_scores, test_r2_scores), 1):
+        gap = tr - te
+        optimism.append(gap)
+        print(f"  Fold {i}: train R² = {tr:.4f}, test R² = {te:.4f}, optimism = {gap:.4f}")
+
     print("\nSummary:")
-    print(f"  RMSE: {np.mean(test_rmse_scores):.4f} ± {np.std(test_rmse_scores):.4f}")
-    print(f"  MAE:  {np.mean(test_mae_scores):.4f} ± {np.std(test_mae_scores):.4f}")
-    print(f"  R²:   {np.mean(test_r2_scores):.4f} ± {np.std(test_r2_scores):.4f}")
+    print(f"  RMSE:        {np.mean(test_rmse_scores):.4f} ± {np.std(test_rmse_scores):.4f}")
+    print(f"  MAE:         {np.mean(test_mae_scores):.4f} ± {np.std(test_mae_scores):.4f}")
+    print(f"  Test R²:     {np.mean(test_r2_scores):.4f} ± {np.std(test_r2_scores):.4f}")
+    print(f"  Train R²:    {np.mean(train_r2_scores):.4f} ± {np.std(train_r2_scores):.4f}")
+    print(f"  Optimism:    {np.mean(optimism):.4f} ± {np.std(optimism):.4f}  (train - test R²)")
     print("="*50 + "\n")
 
 def plot_calibration(y_true, y_pred, run_tag, title="Calibration: Actual vs Predicted"):
@@ -420,27 +432,17 @@ def main(args):
     demographic_cols = [
         'age',
         'gender',
-        'marital_status',
-        'children',
-        'ethnicity_1',
-        'drop_school_1',
-        'accommodation',
         'mh_smoking',
         'audit_1',
         'depression_medication'
     ]
 
     categorical_cols = [
-        'marital_status',
-        'ethnicity_1',
-        'accommodation',
         'mh_smoking',
         'audit_1',
     ]
 
     boolean_cols_demographics = [
-        'children',
-        'drop_school_1',
         'depression_medication',
         'gender'
     ]
@@ -450,19 +452,6 @@ def main(args):
     ]
 
     all_boolean_cols = boolean_cols_demographics + boolean_cols_sleep
-
-    numerical_cols = ['age']
-
-    group_cols = ['participant_name']
-
-    outcome_col = ['phq8_score']
-        
-    cols_to_exclude_numerical = demographic_cols + boolean_cols_sleep + group_cols + outcome_col
-
-    numerical_cols += [
-        col for col in df.columns
-        if col not in cols_to_exclude_numerical
-    ]
 
     if args.model == "xgboost":
         # native categoricals: keep original labels, no cat.codes
@@ -474,17 +463,19 @@ def main(args):
     if args.feature_set == "demographics":
         X = X[demographic_cols]
         all_boolean_cols = boolean_cols_demographics
-        numerical_cols = ["age"]
     elif args.feature_set == "simple_aggregations":
         pass  # all aggregated sleep/activity features + demographics
     elif args.feature_set == "catch22":
         raise NotImplementedError("catch22 features not yet implemented.")
 
-    # Columns MissForest must treat as classification targets: the integer-coded
-    # category-dtype columns emitted by prepare_data (cat.codes categoricals +
-    # 0/1 flags). Derived after feature-set subsetting so e.g. any_disorder is
-    # excluded when it isn't present.
+    # prepare_data drops phq8_score/participant_name and encodes every
+    # categorical/boolean column to 'category' dtype, so X's columns partition
+    # cleanly by dtype: the category columns are the categorical/boolean inputs,
+    # everything else is numeric. Deriving both lists from dtype (rather than a
+    # hand-maintained denylist) keeps them in sync with the column set and with
+    # each other, and adapts automatically to feature-set subsetting.
     categorical_features = X.select_dtypes(include="category").columns.tolist()
+    numerical_cols = X.select_dtypes(exclude="category").columns.tolist()
 
     outer_cv = GroupKFold(n_splits=5)
     inner_cv = GroupKFold(n_splits=3)
@@ -492,6 +483,7 @@ def main(args):
     test_rmse_scores = []
     test_r2_scores = []
     test_mae_scores = []
+    train_r2_scores = []
     fold_params = []
     y_true_all = []
     y_pred_all = []
@@ -533,6 +525,7 @@ def main(args):
                 )
                 best_model.fit(X_train, y_train)
                 y_pred = best_model.predict(X_test)
+                X_train_used = X_train
 
             elif args.imputation == "missforest":
                 # impute each inner fold once (leakage-free), search over cache
@@ -562,6 +555,7 @@ def main(args):
                 )
                 best_model.fit(X_train_imp, y_train)
                 y_pred = best_model.predict(X_test_imp)
+                X_train_used = X_train_imp
 
         elif args.model == "xgboost":
             study = run_optuna_search_xgboost(X_train, y_train, inner_cv, groups_train)
@@ -577,6 +571,7 @@ def main(args):
 
             best_model.fit(X_train, y_train)
             y_pred = best_model.predict(X_test)
+            X_train_used = X_train
 
 
         fold_params.append(best_params)
@@ -588,15 +583,22 @@ def main(args):
         r2 = r2_score(y_test, y_pred)
         mae = mean_absolute_error(y_test, y_pred)
 
+        # Apparent (in-sample) R²: the model re-scored on the data it was fit on.
+        # The gap apparent - test R² is the optimism that pmsampsize/shrinkage
+        # bounds; a large gap is the direct signature of overfitting.
+        train_r2 = r2_score(y_train, best_model.predict(X_train_used))
+
         test_rmse_scores.append(rmse)
         test_r2_scores.append(r2)
         test_mae_scores.append(mae)
+        train_r2_scores.append(train_r2)
 
     print_cv_results(
         fold_params,
         test_rmse_scores,
         test_r2_scores,
-        test_mae_scores
+        test_mae_scores,
+        train_r2_scores
     )
 
     imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
