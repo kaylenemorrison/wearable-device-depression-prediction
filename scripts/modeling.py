@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -408,6 +409,12 @@ def parse_args():
 
 def main(args):
 
+    # Progress to stderr so it shows live in the terminal even though stdout is
+    # redirected to the results file. Step names + shapes only, no participant rows.
+    _run_start = time.time()
+    def log(msg):
+        print(f"[{time.time() - _run_start:7.1f}s] {msg}", file=sys.stderr, flush=True)
+
     print("="*50)
     print("RUN CONFIGURATION")
     print("="*50)
@@ -420,8 +427,10 @@ def main(args):
     print(f"  Model:        {args.model}")
     print("="*50)
 
+    log(f"Run: {args.model} | {args.imputation} | {args.feature_set} | w{args.window_size}")
     data_path = f"../data_merged/final_dataset_w{args.window_size}.parquet"
     df = pd.read_parquet(data_path)
+    log(f"Loaded {data_path} -> {df.shape}")
 
     print(f"\nColumns in final_dataset_w{args.window_size}.parquet:")
     for col in df.columns:
@@ -468,12 +477,6 @@ def main(args):
     elif args.feature_set == "catch22":
         raise NotImplementedError("catch22 features not yet implemented.")
 
-    # prepare_data drops phq8_score/participant_name and encodes every
-    # categorical/boolean column to 'category' dtype, so X's columns partition
-    # cleanly by dtype: the category columns are the categorical/boolean inputs,
-    # everything else is numeric. Deriving both lists from dtype (rather than a
-    # hand-maintained denylist) keeps them in sync with the column set and with
-    # each other, and adapts automatically to feature-set subsetting.
     categorical_features = X.select_dtypes(include="category").columns.tolist()
     numerical_cols = X.select_dtypes(exclude="category").columns.tolist()
 
@@ -488,9 +491,13 @@ def main(args):
     y_true_all = []
     y_pred_all = []
 
-    for _, (train_idx, test_idx) in enumerate(
+    n_outer = outer_cv.get_n_splits()
+    log(f"X={X.shape}, y={len(y)} | starting {n_outer}-fold outer CV")
+
+    for fold_idx, (train_idx, test_idx) in enumerate(
         outer_cv.split(X, y, groups), 1
     ):
+        log(f"Outer fold {fold_idx}/{n_outer}: train={len(train_idx)}, test={len(test_idx)}")
 
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
@@ -510,6 +517,7 @@ def main(args):
 
             if args.imputation == "simple":
                 # imputation happens inside the pipeline, per trial
+                log(f"  fold {fold_idx}: Optuna search (elastic_net, simple imputation)...")
                 study = run_optuna_search_simple_imputation_elastic_net(
                     X_train, y_train, inner_cv, groups_train,
                     categorical_cols, all_boolean_cols, numerical_cols
@@ -529,10 +537,12 @@ def main(args):
 
             elif args.imputation == "missforest":
                 # impute each inner fold once (leakage-free), search over cache
+                log(f"  fold {fold_idx}: imputing inner folds (MissForest)...")
                 cached_folds = impute_inner_folds(
                     X_train, y_train, groups_train, inner_cv,
                     categorical_features, iterations=3
                 )
+                log(f"  fold {fold_idx}: Optuna search (elastic_net, missforest)...")
                 study = run_optuna_search_missforest_imputation_elastic_net(
                     cached_folds, categorical_cols,
                     all_boolean_cols, numerical_cols
@@ -541,6 +551,7 @@ def main(args):
 
                 # impute outer train/test for the final fold model (fit on
                 # outer-train only, applied to outer-test)
+                log(f"  fold {fold_idx}: imputing outer train/test (MissForest)...")
                 X_train_imp, X_test_imp = missforest_impute(
                     X_train, X_test, categorical_features, max_iter=3
                 )
@@ -558,6 +569,7 @@ def main(args):
                 X_train_used = X_train_imp
 
         elif args.model == "xgboost":
+            log(f"  fold {fold_idx}: Optuna search (xgboost)...")
             study = run_optuna_search_xgboost(X_train, y_train, inner_cv, groups_train)
             best_params = study.best_params
 
@@ -593,6 +605,10 @@ def main(args):
         test_mae_scores.append(mae)
         train_r2_scores.append(train_r2)
 
+        log(f"  fold {fold_idx} done: RMSE={rmse:.3f}, MAE={mae:.3f}, "
+            f"test R2={r2:.3f}, train R2={train_r2:.3f}")
+
+    log("Outer CV complete; fitting final model on full dataset...")
     print_cv_results(
         fold_params,
         test_rmse_scores,
@@ -667,6 +683,8 @@ def main(args):
 
     print_model_summary(args.model, final_model, final_best_params)
     print("\n" + "="*50)
+
+    log("Done.")
 
 if __name__ == "__main__":
     args = parse_args()
