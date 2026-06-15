@@ -148,16 +148,8 @@ def create_simple_aggs_heartrate(phq8, heartrate, window_size, missing_threshold
     agg.columns = [f'{col}_{stat}' for col, stat in agg.columns]
     agg = agg.reset_index()
 
-    ## coefficient of variation for every column
-    agg_cv = window.groupby(GROUP_COLS)[value_cols].agg(
-        lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan
-    )
-    agg_cv.columns = [f'{col}_cv' for col in value_cols]
-    agg_cv = agg_cv.reset_index()
-
     agg = (
         agg
-        .merge(agg_cv, on=GROUP_COLS, how='left')
         .merge(missing_counts, on=GROUP_COLS, how='left')
         .merge(structural_counts, on=GROUP_COLS, how='left')
     )
@@ -186,11 +178,17 @@ def create_simple_aggs_steps(phq8, steps, window_size, missing_threshold):
     window = create_window(phq8, window_size)
     steps = steps.rename(columns = {'timeInterval_ID': 'timeInterval_ID_steps'})
 
+    # FEATURE_027-038 are the BOUT DEFINITION 1 features; bout definition 2
+    # (FEATURE_039-050) is kept instead, so no aggregations are computed on
+    # bout def 1 (excluded from value_cols below, and from sum_cols further down).
+    bout_def1_cols = [f"FEATURE_{i:03d}" for i in range(27, 39)]
+
     # Every non-key column of the steps table (FEATURE_*, QUALITY_METRIC_*,
-    # MISSING_RATE). Counts are persisted for all of these; simple aggregations
-    # are computed for all of them too.
+    # MISSING_RATE) except bout definition 1. Counts are persisted for all of
+    # these; simple aggregations are computed for all of them too.
     value_cols = [c for c in steps.columns
-                  if c not in ('participant_name', 'timeInterval_ID_steps')]
+                  if c not in ('participant_name', 'timeInterval_ID_steps')
+                  and c not in bout_def1_cols]
 
     window = window.merge(
         steps,
@@ -226,18 +224,12 @@ def create_simple_aggs_steps(phq8, steps, window_size, missing_threshold):
 
     ## for some columns, sum is an appropriate aggregation as well
     ## steps totals: FEATURE_001 (daily total), FEATURE_019 (nighttime),
-    ## FEATURE_027, 033 (bout counts), FEATURE_039, 045 (bout def 2 counts)
-    sum_cols = ["FEATURE_001", "FEATURE_019", "FEATURE_027", "FEATURE_033", "FEATURE_039", "FEATURE_045"]
+    ## FEATURE_039, 045 (bout def 2 counts). Bout def 1 counts (FEATURE_027, 033)
+    ## are excluded.
+    sum_cols = ["FEATURE_001", "FEATURE_019", "FEATURE_039", "FEATURE_045"]
     agg_sum = window.groupby(GROUP_COLS)[sum_cols].agg("sum")
     agg_sum.columns = [f'{col}_sum' for col in sum_cols]
     agg_sum = agg_sum.reset_index()
-
-    ## coefficient of variation for all non-time columns
-    agg_cv = window.groupby(GROUP_COLS)[cols].agg(
-        lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan
-    )
-    agg_cv.columns = [f'{col}_cv' for col in cols]
-    agg_cv = agg_cv.reset_index()
 
     ## Time-of-day columns: circular mean/median/std, linear min/max
     ## FEATURE_022: most active hour; FEATURE_024/025/026: percentile hours
@@ -260,7 +252,6 @@ def create_simple_aggs_steps(phq8, steps, window_size, missing_threshold):
 
     agg = (
         agg
-        .merge(agg_cv, on=GROUP_COLS, how='left')
         .merge(agg_sum, on=GROUP_COLS, how='left')
         .merge(feature_timecols_agg, on=GROUP_COLS, how='left')
         .merge(missing_counts, on=GROUP_COLS, how='left')
@@ -346,15 +337,6 @@ def create_simple_aggs_activity(phq8, activity, window_size, missing_threshold):
     agg_sum.columns = [f'{col}_sum' for col in sum_cols]
     agg_sum = agg_sum.reset_index()
 
-    ## coefficient of variation for every column except the circular hour-of-day
-    ## FEATURE_018 (a CV on a clock time is not meaningful). `cols` is value_cols
-    ## minus FEATURE_018.
-    agg_cv = window.groupby(GROUP_COLS)[cols].agg(
-        lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan
-    )
-    agg_cv.columns = [f'{col}_cv' for col in cols]
-    agg_cv = agg_cv.reset_index()
-
     ## FEATURE_018 ("most active hour") is a time-of-day in hours (0-23), which
     ## is circular (hour 23 is adjacent to hour 0): use circular mean/median/std.
     ## min/max stay linear (same midnight-wrap caveat as the sleep timing block).
@@ -373,7 +355,6 @@ def create_simple_aggs_activity(phq8, activity, window_size, missing_threshold):
     agg = (
         agg
         .merge(agg_sum, on=GROUP_COLS, how='left')
-        .merge(agg_cv, on=GROUP_COLS, how='left')
         .merge(feature_018_agg, on=GROUP_COLS, how='left')
         .merge(missing_counts, on=GROUP_COLS, how='left')
         .merge(structural_counts, on=GROUP_COLS, how='left')
@@ -436,7 +417,6 @@ def create_simple_aggs_sleep(phq8, sleep, window_size, missing_threshold):
         window.groupby(GROUP_COLS)["total_sleep_time"]
         .agg(
             total_sleep_time_pct_short_sleep=lambda x: (x.dropna() < SIX_HOURS_SECONDS).mean(),
-            total_sleep_time_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan,
         )
         .reset_index()
     )
@@ -447,13 +427,7 @@ def create_simple_aggs_sleep(phq8, sleep, window_size, missing_threshold):
     funcs_time_in_bed_agg = ['min', 'max', 'mean', 'median', 'std', 'sum']
     time_in_bed_agg = window.groupby(GROUP_COLS)[["time_in_bed"]].agg(funcs_time_in_bed_agg)
     time_in_bed_agg.columns = [f"{col}_{stat}" for col, stat in time_in_bed_agg.columns]
-
-    time_in_bed_custom = (
-        window.groupby(GROUP_COLS)["time_in_bed"]
-        .agg(time_in_bed_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan)
-        .reset_index()
-    )
-    time_in_bed_agg = time_in_bed_agg.reset_index().merge(time_in_bed_custom, on=GROUP_COLS, how="left")
+    time_in_bed_agg = time_in_bed_agg.reset_index()
 
 
     """ sleep stage composition features """
@@ -478,19 +452,8 @@ def create_simple_aggs_sleep(phq8, sleep, window_size, missing_threshold):
             light_restorative_ratio_mean=('light_restorative_ratio', 'mean'),
             light_restorative_ratio_median=('light_restorative_ratio', 'median'),
             light_restorative_ratio_std=('light_restorative_ratio', 'std'),
-            light_pct_cv=('light_pct', lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan),
-            deep_pct_cv=('deep_pct', lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan),
-            REM_pct_cv=('REM_pct', lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan),
-            awake_pct_cv=('awake_pct', lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan),
-            NREM_pct_cv=('NREM_pct', lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan),
         )
         .reset_index()
-    )
-    sleep_stage_custom['rem_deep_ratio_cv'] = (
-        sleep_stage_custom['rem_deep_ratio_std'] / sleep_stage_custom['rem_deep_ratio_mean'].replace(0, np.nan)
-    )
-    sleep_stage_custom['light_restorative_ratio_cv'] = (
-        sleep_stage_custom['light_restorative_ratio_std'] / sleep_stage_custom['light_restorative_ratio_mean'].replace(0, np.nan)
     )
     sleep_stage_agg = sleep_stage_agg.reset_index().merge(sleep_stage_custom, on=GROUP_COLS, how="left")
 
@@ -535,7 +498,6 @@ def create_simple_aggs_sleep(phq8, sleep, window_size, missing_threshold):
     rem_latency_custom = (
         window.groupby(GROUP_COLS)["rem_latency"]
         .agg(
-            rem_latency_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan,
             rem_latency_pct_high=lambda x: (x.dropna() > 2).mean(),
             rem_latency_pct_very_high=lambda x: (x.dropna() > 3).mean(),
             rem_latency_range=lambda x: x.max() - x.min(),
@@ -548,13 +510,7 @@ def create_simple_aggs_sleep(phq8, sleep, window_size, missing_threshold):
     funcs_sleep_efficiency = ['min', 'max', 'mean', 'median', 'std']
     sleep_efficiency_agg = window.groupby(GROUP_COLS)[["sleep_efficiency"]].agg(funcs_sleep_efficiency)
     sleep_efficiency_agg.columns = [f"{col}_{stat}" for col, stat in sleep_efficiency_agg.columns]
-
-    sleep_efficiency_custom = (
-        window.groupby(GROUP_COLS)["sleep_efficiency"]
-        .agg(sleep_efficiency_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan)
-        .reset_index()
-    )
-    sleep_efficiency_agg = sleep_efficiency_agg.reset_index().merge(sleep_efficiency_custom, on=GROUP_COLS, how="left")
+    sleep_efficiency_agg = sleep_efficiency_agg.reset_index()
     
     """ awakenings """
     funcs_awakenings = ["min", "max", "mean", "median", "std", "sum"]
@@ -565,7 +521,6 @@ def create_simple_aggs_sleep(phq8, sleep, window_size, missing_threshold):
     awakenings_custom = (
         window.groupby(GROUP_COLS)["awakenings"]
         .agg(
-            awakenings_cv=lambda x: x.std() / x.mean() if x.mean() > 0 else np.nan,
             awakenings_pct_any=lambda x: (x.dropna() > 0).mean(),
             awakenings_pct_mod=lambda x: (x.dropna() >= 2).mean(),
             awakenings_pct_high=lambda x: (x.dropna() >= 3).mean(),
@@ -635,7 +590,7 @@ def parse_args():
     parser.add_argument(
         "--window-size",
         type=int,
-        choices=[3, 5, 7, 14],
+        choices=[3, 5, 7, 14, 21, 28],
         default=14,
         help="Window size for the aggregated features. Default: 14.",
     )
@@ -729,9 +684,8 @@ def main():
 
     final_dataset = final_dataset.drop(columns=["timeInterval_ID"])
 
-    # Drop aggregate columns with no observed values at all (e.g. a CV whose
-    # source column never has a positive mean): they carry no information and
-    # trip per-fold imputers downstream.
+    # Drop aggregate columns with no observed values at all: they carry no
+    # information and trip per-fold imputers downstream.
     all_nan_cols = final_dataset.columns[final_dataset.isna().all()].tolist()
     if all_nan_cols:
         final_dataset = final_dataset.drop(columns=all_nan_cols)

@@ -376,7 +376,7 @@ def parse_args():
     parser.add_argument(
         "--window-size",
         type=int,
-        choices=[3, 5, 7, 14],
+        choices=[3, 5, 7, 14, 21, 28],
         default=14,
         help="Window size for the aggregated features. Default: 14.",
     )

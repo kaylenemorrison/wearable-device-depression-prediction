@@ -67,7 +67,7 @@ def base_construct(col):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--window-size", type=int, default=14, choices=[3, 5, 7, 14])
+    ap.add_argument("--window-size", type=int, default=14, choices=[3, 5, 7, 14, 21, 28])
     args = ap.parse_args()
 
     df = pd.read_parquet(f"../data_merged/final_dataset_w{args.window_size}.parquet")

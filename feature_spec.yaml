@@ -1,0 +1,207 @@
+# Feature specification for the merged modeling dataset.
+#
+# Purpose: hand-pick base daily columns and assign each a *type-appropriate*
+# aggregation set, instead of applying the blanket [min,max,mean,median,std]
+# grid to every column. Target budget: ~120 features total.
+#
+# Two feature families, pooled into one vector:
+#   - basic aggregations  : level / spread / extreme / total over the window.
+#   - catch22 (panel)     : a fixed, axis-diverse panel of z-normalized dynamical
+#                           features spread across many base signals; complementary
+#                           to basic (catch22 discards level & scale). See `catch22:`.
+#
+# Column naming: sleep uses readable names; activity/steps/heartrate use the
+# source FEATURE_xxx codes (activity = v1, steps = v2, heartrate = v2). Confirm
+# column availability against data_cleaned/*.csv before building — the v1/v2
+# split determines which HRV/quality columns physically exist.
+
+meta:
+  basic_feature_count: 76     # see per-stream subtotals below
+  catch22_feature_count: ~32  # fixed panel (~4) x base set (8); see `catch22:`
+  total_target: ~108          # headroom under the ~120 cap
+
+  # Output naming convention (matches merge_datasets.py): "<stream>_<col>_<stat>".
+  # mean is intentionally DROPPED where median is present (collinear); median is
+  # kept as the robust level term.
+  #
+  # This set is FIXED and hand-curated: it is NOT correlation-pruned or otherwise
+  # feature-selected downstream. Redundancy is therefore managed HERE, at design
+  # time (type-appropriate aggregations, collinear columns dropped, axis-diverse
+  # catch22 panel); any residual collinearity is left to the model's elastic-net
+  # L2 regularization rather than removed.
+  #
+  # catch22 is configured in its own top-level `catch22:` section (gating rules,
+  # the fixed feature panel, and the base-feature set it is applied to). That is
+  # the SINGLE source of truth for which columns get catch22 -- the stream
+  # entries below carry no per-feature catch22 flag, to keep the two from drifting.
+
+# ---------------------------------------------------------------------------
+# Aggregation profiles. Each base feature below references one of these.
+# circ_* = circular stats (time-of-day in hours); see merge_datasets.py.
+# ---------------------------------------------------------------------------
+profiles:
+  level:            [median, std]              # already-averaged levels / percentages
+  level_low:        [median, std, min]         # + worst-case low (protective features)
+  level_high:       [median, std, max]         # + worst-case high (symptom features)
+  total:            [sum, std]                  # additive counts/durations (sum NOT median;
+                                                #   they are collinear at fixed window size)
+  total_low:        [sum, std, min]            # + least-active day
+  timeofday:        [circ_median, circ_std]    # circular level + regularity
+  binary_count:     [sum, max]                 # day-flags: #days + any-day
+  binary_count_min: [sum]                      # day-flags where only the count matters
+
+# ===========================================================================
+# SLEEP  (subtotal: 28)  — priority stream
+# ===========================================================================
+sleep:
+  total_sleep_time: { profile: level_low }                   # 3
+  sleep_efficiency: { profile: level_low }                   # 3
+  deep_pct:         { profile: level }                       # 2
+  REM_pct:          { profile: level }                       # 2
+  awake_pct:        { profile: level_high }                  # 3
+  sleep_onset:      { profile: timeofday }                   # 2  (circular; basic-only)
+  sleep_offset:     { profile: timeofday }                   # 2  (circular; basic-only)
+  sleep_midpoint:   { profile: timeofday }                   # 2  (derived; circadian phase)
+  rem_latency:      { profile: level_low }                   # 3  (low tail = shortened REM latency, a depression marker)
+  awakenings:       { profile: level_high }                  # 3
+  insomnia:         { profile: binary_count }                # 2
+  hypersomnia:      { profile: binary_count_min }            # 1
+  # NREM_pct dropped (collinear: stage percentages sum to ~1).
+
+# ===========================================================================
+# HEART RATE  (v2)  (subtotal: 16)
+# ===========================================================================
+heartrate:
+  FEATURE_017: { profile: level, desc: "Mean HR across all day" }
+  FEATURE_006: { profile: level, desc: "Mean hourly-mean HR during night (resting proxy)" }
+  FEATURE_018: { profile: level, desc: "Std of HR across all day (within-day variability)" }
+  FEATURE_005: { profile: level, desc: "Max-min of hourly mean HR (daily HR range)" }
+  FEATURE_021: { profile: level, desc: "Mean HR sedentary, night only (resting proxy)" }
+  FEATURE_030: { profile: level, desc: "Mean SDNN across all day (HRV, v2)" }
+  FEATURE_031: { profile: level, desc: "Mean RMSSD across all day (HRV, v2)" }
+  FEATURE_011: { profile: level, desc: "Lempel-Ziv complexity, hourly mean HR" }
+  # FEATURE_032/033 (sedentary HRV v2) dropped: collinear with 030/031.
+
+# ===========================================================================
+# ACTIVITY  (v1)  (subtotal: 15)
+# ===========================================================================
+activity:
+  FEATURE_001: { profile: total,     desc: "Sedentary minutes/day" }
+  FEATURE_004: { profile: total,     desc: "Very active minutes/day" }
+  FEATURE_005: { profile: level,     desc: "Calories/day" }
+  FEATURE_013: { profile: total,     desc: "Active minutes, nighttime (00:00-05:59)" }
+  FEATURE_015: { profile: level,     desc: "Ratio night:day active minutes" }
+  FEATURE_016: { profile: level_low, desc: "Number of active hours/day" }
+  FEATURE_018: { profile: timeofday, desc: "Most active hour (circular; basic-only)" }
+  # FEATURE_002 (lightly active) dropped: keep sedentary + very active as the
+  # informative tails of the activity-intensity spectrum.
+
+# ===========================================================================
+# STEPS  (v2)  (subtotal: 13)
+# ===========================================================================
+steps:
+  FEATURE_001: { profile: total_low, desc: "Total daily steps" }
+  FEATURE_019: { profile: total,     desc: "Steps during nighttime (00:00-05:59)" }
+  FEATURE_039: { profile: level,     desc: "Number of bouts/day (bout def 2)" }
+  FEATURE_040: { profile: level,     desc: "Mean bout duration/day (bout def 2)" }
+  FEATURE_022: { profile: timeofday, desc: "Most active hour (circular; basic-only)" }
+  FEATURE_021: { profile: level,     desc: "Max of hourly step sum (peak activity)" }
+  # FEATURE_006 (mean steps/min) dropped: collinear with FEATURE_001 total.
+
+# ===========================================================================
+# ADHERENCE  (subtotal: 4)  — already produced by merge_datasets.py
+# ===========================================================================
+adherence:
+  - sleep_missing_last{N}       # structural (row-absent) day count per stream
+  - activity_missing_last{N}
+  - steps_missing_last{N}
+  - heartrate_missing_last{N}
+
+# ===========================================================================
+# catch22 configuration  (SINGLE source of truth for all catch22 columns)
+#
+# Model: a FIXED PANEL of ~4 catch22 features, each capturing a DISTINCT
+# dynamical axis, applied across a BROAD set of base signals -- rather than the
+# full survivable subset on a few signals. Rationale: at these short lengths the
+# survivable features are mostly distributional and redundant with one another,
+# so depth per signal has diminishing returns; spreading a compact, axis-diverse
+# panel across more signals buys more independent dynamical information, and the
+# basic aggregations already cover level/spread.
+#
+# Budget: ~4 panel features x 8 base signals ~= 32.
+# ===========================================================================
+catch22:
+  # --- gating ------------------------------------------------------------
+  enabled_window_sizes: [14, 21, 28]   # >=14 only (catch22 needs a long-enough
+                                       # series); 3/5/7 stay basic-only. catch22 is
+                                       # MORE justified at 21/28 (more points).
+  min_present_fraction: 0.75      # FABRICATION bound, not a catch22-stability
+                                  # bound: missing_day_handling=impute fixes the
+                                  # series length at the WINDOW SIZE, so catch22
+                                  # stability is governed by that length (>=14, see
+                                  # panel_source) and this only caps how much of
+                                  # each series is interpolated. Floor (real days)
+                                  # = ceil(0.75 * window): 11@14, 16@21, 21@28
+                                  # -> <=25% interpolated. Below that a series is
+                                  # too fabricated to read as real dynamics.
+                                  # Windows under the floor get an all-NaN catch22
+                                  # block (imputed downstream).
+                                  # Coverage is ~stable across windows at this
+                                  # fraction (scratch/catch22_window_survival.py):
+                                  # sleep ~43-44%, others ~60-82% at N=14/21/28 --
+                                  # the fractional floor scales with the window, so
+                                  # longer windows do NOT collapse coverage.
+  missing_day_handling: "impute"  # interpolate the missing days within the window
+                                  # so length is ALWAYS the window size (spacing
+                                  # preserved, bounded injected smoothness, and a
+                                  # fixed length => unambiguous admissible set).
+                                  # Per-row, uses only that window's own days ->
+                                  # not CV leakage. Alternative "drop" gives a
+                                  # variable-length series with distorted spacing.
+
+  # --- panel selection (OUTCOME-BLIND) -----------------------------------
+  # Picked from catch22_shortseries_test.py survivors at length 14 -- the SHORTEST
+  # enabled window and therefore the strictest case (under impute the series
+  # length equals the window size). At N=14, 19/22 are OK, 0 NaN-prone, and all 4
+  # picks below stay OK at 21 and 28 too. The 3 degenerate features
+  # (SC_FluctAnal_* DFA/rsrange, SP_Summaries_welch_rect_area) need ~50+ points
+  # and are excluded. One feature per DISTINCT axis, as mutually independent as
+  # possible -- redundancy is controlled HERE, at design time, because this set is
+  # fixed and NOT correlation-pruned downstream; any residual collinearity is left
+  # to the model's regularization (elastic-net L2). NEVER select by correlation
+  # with PHQ-8 (leakage). Same panel applied to every base signal and every
+  # enabled window (comparability).
+  panel_size: 4
+  panel_source: "catch22_shortseries_test.py @ length=14 (shortest enabled window; picks valid at 21/28)"
+  panel:
+    - axis: outlier_extreme       # extreme-event / tail structure
+      feature: DN_OutlierInclude_p_001_mdrmd
+      candidates: [DN_OutlierInclude_p_001_mdrmd, DN_OutlierInclude_n_001_mdrmd]
+    - axis: persistence_run       # longest stretch above the mean
+      feature: SB_BinaryStats_mean_longstretch1
+      candidates: [SB_BinaryStats_mean_longstretch1, SB_BinaryStats_diff_longstretch0]
+    - axis: distribution_shape    # marginal shape / modal structure
+      feature: DN_HistogramMode_5
+      candidates: [DN_HistogramMode_5, DN_HistogramMode_10]
+    - axis: predictability        # autocorrelation timescale (first 1/e crossing)
+      feature: CO_f1ecac
+      candidates: [CO_f1ecac, CO_FirstMin_ac, SB_MotifThree_quantile_hh]
+
+  # --- base signals the panel is applied to (~10) ------------------------
+  # catch22 assumes a linear, z-normalizable series, so circular time-of-day
+  # columns (sleep_onset/offset/midpoint, most-active-hour) are NEVER included.
+  # Sleep is capped at 2 signals: its catch22 coverage is only ~43-44% at the
+  # 0.75 floor (steep nightly-gap decay, per catch22_window_survival.py), so each
+  # sleep catch22 column is ~half feature-imputed -- and the four sleep signals
+  # are coverage-redundant (identical row-presence). Keep the two clinically
+  # central ones; awakenings/awake_pct stay basic-only. The high-coverage HR/
+  # activity/steps streams (62-82%, nearly all-or-nothing) carry the rest.
+  base_features:
+    - sleep.total_sleep_time      # night-to-night sleep instability
+    - sleep.sleep_efficiency      # consolidation dynamics
+    - heartrate.FEATURE_017       # daily mean HR dynamics
+    - heartrate.FEATURE_006       # night / resting HR dynamics
+    - activity.FEATURE_001        # sedentary-burden rhythm
+    - activity.FEATURE_016        # active-hours rhythm
+    - steps.FEATURE_001           # daily step-volume rhythm
+    - steps.FEATURE_039           # activity-fragmentation (bout-count) dynamics

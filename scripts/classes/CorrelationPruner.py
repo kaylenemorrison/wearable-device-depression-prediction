@@ -13,9 +13,7 @@ class CorrelationPruner(BaseEstimator, TransformerMixin):
     `1 - threshold`, and keeps one representative per cluster. Because it uses
     only X (never y), it is leakage-safe; fit() learns the keep-set from the
     training rows alone, so refitting per fold inside an sklearn Pipeline carries
-    no leakage. Intended for the catch22 feature set, where the same statistic is
-    computed across many correlated sub-signals, but it is harmless on any
-    numeric block.
+    no leakage. 
 
     Parameters
     ----------
@@ -26,6 +24,11 @@ class CorrelationPruner(BaseEstimator, TransformerMixin):
         Correlation used to build the distance matrix. Spearman is the default
         because catch22 outputs are skewed/heavy-tailed, so rank correlation
         captures redundancy more robustly than Pearson.
+    linkage_method : {"average", "ward", "complete"}, default="average"
+        Linkage criterion for hierarchical clustering. "average" (UPGMA) uses
+        mean pairwise distance; "ward" minimises within-cluster variance (tends
+        to produce more balanced clusters); "complete" uses maximum pairwise
+        distance (most aggressive at separating dissimilar features).
     representative : {"medoid", "variance"}, default="medoid"
         How to pick the survivor from each cluster. "medoid" keeps the member
         with the highest mean |corr| to its cluster-mates (most central, best
@@ -40,9 +43,10 @@ class CorrelationPruner(BaseEstimator, TransformerMixin):
         Number of features seen during fit.
     """
 
-    def __init__(self, threshold=0.9, method="spearman", representative="medoid"):
+    def __init__(self, threshold=0.9, method="spearman", linkage_method="average", representative="medoid"):
         self.threshold = threshold
         self.method = method
+        self.linkage_method = linkage_method
         self.representative = representative
 
     def fit(self, X, y=None):
@@ -62,7 +66,7 @@ class CorrelationPruner(BaseEstimator, TransformerMixin):
             self.keep_columns_ = list(corr.columns)
             return self
 
-        Z = linkage(squareform(dist, checks=False), method="average")
+        Z = linkage(squareform(dist, checks=False), method=self.linkage_method)
         labels = fcluster(Z, t=1.0 - self.threshold, criterion="distance")
 
         keep = []
