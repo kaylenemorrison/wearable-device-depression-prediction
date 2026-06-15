@@ -6,7 +6,8 @@ data_merged/
 # --- Results ---
 results/
 
-# --- Untracked Scratch Notebooks ---
+# --- Scratch Notebooks (untracked) ---
+scratch/
 scratch_untracked/
 
 # --- Jupyter Notebooks ---
