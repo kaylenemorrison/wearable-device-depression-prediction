@@ -1,4 +1,6 @@
 import argparse
+import glob
+import json
 import os
 import sys
 import time
@@ -21,10 +23,30 @@ from sklearn.model_selection import GroupKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import xgboost as xgb
+import yaml
 
 # os.environ["TQDM_DISABLE"] = "True"
 
 SEED = 42
+PATH_TO_YAML = "../feature_spec.yaml"
+
+def catch22_enabled_windows():
+    """Window sizes for which the catch22 panel is produced, read from the
+    feature spec so modeling.py and merge_datasets.py agree on the gating (and
+    thus on the cp/cpNA filename tag) without hardcoding the set in two places."""
+    with open(PATH_TO_YAML) as fh:
+        spec = yaml.safe_load(fh)
+    return spec.get("catch22", {}).get("enabled_window_sizes", [])
+
+def dataset_stem(window_size, simple_present_fraction, catch22_present_fraction,
+                 catch22_enabled):
+    """Filename stem for a merged dataset, mirroring merge_datasets.dataset_stem.
+    `sp` = simple-aggregation present fraction, `cp` = catch22 present fraction;
+    cp is recorded as NA when catch22 is gated off for this window. Must stay in
+    sync with merge_datasets.py so the right parquet/manifest load.
+    """
+    cp = f"{catch22_present_fraction:g}" if catch22_enabled else "NA"
+    return f"final_dataset_w{window_size}_sp{simple_present_fraction:g}_cp{cp}"
 
 def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
     """Split df into (X, y, groups) and encode the categorical/boolean columns.
@@ -369,9 +391,14 @@ def parse_args():
     )
     parser.add_argument(
         "--feature-set",
-        choices=["demographics", "simple_aggregations", "catch22"],
-        default="simple_aggregations",
-        help="Which feature set to use. Default: simple_aggregations.",
+        nargs="+",
+        choices=["demographics", "simple", "catch22"],
+        default=["simple"],
+        help=(
+            "One or more feature families to pool (any non-empty subset of "
+            "demographics, simple, catch22). `simple` includes the adherence "
+            "missingness counts. Default: simple."
+        ),
     )
     parser.add_argument(
         "--window-size",
@@ -379,6 +406,26 @@ def parse_args():
         choices=[3, 5, 7, 14, 21, 28],
         default=14,
         help="Window size for the aggregated features. Default: 14.",
+    )
+    parser.add_argument(
+        "--min-present-fraction",
+        type=float,
+        default=0.75,
+        help=(
+            "Present-fraction floor of the SIMPLE aggregations to load (the `sp` "
+            "in the merged filename). Selects which merge_datasets.py output to "
+            "model on; must match an existing dataset. Default: 0.75."
+        ),
+    )
+    parser.add_argument(
+        "--catch22-min-present-fraction",
+        type=float,
+        default=0.75,
+        help=(
+            "Present-fraction floor of the CATCH22 panel to load (the `cp` in the "
+            "merged filename). Selects which merge_datasets.py output to model on; "
+            "must match an existing dataset. Default: 0.75."
+        ),
     )
     parser.add_argument(
         "--imputation",
@@ -393,6 +440,22 @@ def parse_args():
         help="Predictive model. Default: elastic_net.",
     )
     args = parser.parse_args()
+
+    # Normalize the selected families to a fixed order and drop duplicates, so
+    # the run tag / output filename are deterministic regardless of CLI order.
+    family_order = ["demographics", "simple", "catch22"]
+    args.feature_set = [f for f in family_order if f in args.feature_set]
+    args.feature_set_tag = "+".join(args.feature_set)
+
+    # No numeric range check on the fractions: they only pick which generated
+    # dataset to load, so the file-existence check in main() is the real guard
+    # (it also handles valid-but-not-yet-built fractions, and lists what exists).
+    # cp is recorded as NA when catch22 is gated off for this window, matching
+    # merge_datasets.dataset_stem so the loaded filename lines up.
+    args.catch22_enabled = args.window_size in catch22_enabled_windows()
+    _cp = (f"{args.catch22_min_present_fraction:g}"
+           if args.catch22_enabled else "NA")
+    args.fraction_tag = f"sp{args.min_present_fraction:g}_cp{_cp}"
 
     # XGBoost handles missing values natively; imputation must not be applied.
     if args.model == "xgboost":
@@ -418,8 +481,10 @@ def main(args):
     print("="*50)
     print("RUN CONFIGURATION")
     print("="*50)
-    print(f"  Feature set:  {args.feature_set}")
+    print(f"  Feature set:  {args.feature_set_tag}  ({', '.join(args.feature_set)})")
     print(f"  Window size:  {args.window_size}")
+    print(f"  Present frac: simple={args.min_present_fraction:g}, "
+          f"catch22={args.catch22_min_present_fraction:g}")
     if args.model == "xgboost":
         print(f"  Imputation:   none (native NaN handling)")
     else:
@@ -427,55 +492,80 @@ def main(args):
     print(f"  Model:        {args.model}")
     print("="*50)
 
-    log(f"Run: {args.model} | {args.imputation} | {args.feature_set} | w{args.window_size}")
-    data_path = f"../data_merged/final_dataset_w{args.window_size}.parquet"
+    log(f"Run: {args.model} | {args.imputation} | {args.feature_set_tag} | "
+        f"w{args.window_size} | {args.fraction_tag}")
+
+    # The dataset to load is identified by window + both present-fraction floors
+    # (sp/cp). The fractions only select a file, so file existence is the guard:
+    # a missing dataset (out-of-range OR valid-but-not-yet-built) errors with the
+    # list of what exists and the exact command to generate this one.
+    data_dir = "../data_merged"
+    stem = dataset_stem(args.window_size, args.min_present_fraction,
+                        args.catch22_min_present_fraction, args.catch22_enabled)
+    data_path = f"{data_dir}/{stem}.parquet"
+    manifest_path = f"{data_dir}/{stem}_columns.json"
+
+    if not os.path.exists(data_path):
+        available = sorted(
+            os.path.basename(p)
+            for p in glob.glob(f"{data_dir}/final_dataset_w*.parquet")
+        )
+        listing = "\n  ".join(available) if available else "(none found)"
+        sys.exit(
+            f"Merged dataset not found: {data_path}\n"
+            f"Available:\n  {listing}\n"
+            f"Generate it with: python merge_datasets.py "
+            f"--window-size {args.window_size} "
+            f"--min-present-fraction {args.min_present_fraction:g} "
+            f"--catch22-min-present-fraction {args.catch22_min_present_fraction:g}"
+        )
+
     df = pd.read_parquet(data_path)
     log(f"Loaded {data_path} -> {df.shape}")
 
-    print(f"\nColumns in final_dataset_w{args.window_size}.parquet:")
-    for col in df.columns:
+    # The column manifest (emitted alongside the parquet) maps each feature
+    # family to the columns it produced, post all-NaN-drop and catch22 gating.
+    # It is the single source of truth for feature-set selection.
+    if not os.path.exists(manifest_path):
+        sys.exit(
+            f"Column manifest not found: {manifest_path}. "
+            f"Re-run merge_datasets.py for this dataset to emit it."
+        )
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+
+    # Pool the selected families. catch22 is absent (empty list) at window sizes
+    # where the panel is not produced; selecting it there is a hard error.
+    feature_cols = []
+    for family in args.feature_set:
+        fam_cols = manifest.get(family, [])
+        if not fam_cols:
+            sys.exit(
+                f"Feature family '{family}' has no columns for window size "
+                f"{args.window_size} (catch22 is only produced for longer "
+                f"windows). Drop it from --feature-set or pick a larger window."
+            )
+        feature_cols += [c for c in fam_cols if c in df.columns]
+
+    print(f"\nSelected {len(feature_cols)} feature columns "
+          f"from families [{args.feature_set_tag}]:")
+    for col in feature_cols:
         print(f"  {col}")
 
-    df["any_disorder"] = df["any_disorder"].astype('category')
+    # Keep only the selected features plus the keys prepare_data needs.
+    df = df[["participant_name", "phq8_score"] + feature_cols]
 
-    demographic_cols = [
-        'age',
-        'gender',
-        'mh_smoking',
-        'audit_1',
-        'depression_medication'
-    ]
-
-    categorical_cols = [
-        'mh_smoking',
-        'audit_1',
-    ]
-
-    boolean_cols_demographics = [
-        'depression_medication',
-        'gender'
-    ]
-
-    boolean_cols_sleep = [
-        'any_disorder'
-    ]
-
-    all_boolean_cols = boolean_cols_demographics + boolean_cols_sleep
+    # Demographic typing, intersected with the selected columns so the
+    # categorical/boolean handling activates only when demographics is included.
+    categorical_cols = [c for c in ['mh_smoking', 'audit_1'] if c in feature_cols]
+    all_boolean_cols = [c for c in ['depression_medication', 'gender'] if c in feature_cols]
 
     if args.model == "xgboost":
         # native categoricals: keep original labels, no cat.codes
         X, y, groups = prepare_data(df, categorical_cols, all_boolean_cols,
                                     encode_as_codes=False)
     else:
-        X, y, groups = prepare_data(df, categorical_cols, boolean_cols_demographics)
-
-    if args.feature_set == "demographics":
-        X = X[demographic_cols]
-        all_boolean_cols = boolean_cols_demographics
-    elif args.feature_set == "simple_aggregations":
-        pass  # all aggregated sleep/activity features + demographics
-    elif args.feature_set == "catch22":
-        raise NotImplementedError("catch22 features not yet implemented.")
+        X, y, groups = prepare_data(df, categorical_cols, all_boolean_cols)
 
     categorical_features = X.select_dtypes(include="category").columns.tolist()
     numerical_cols = X.select_dtypes(exclude="category").columns.tolist()
@@ -618,7 +708,8 @@ def main(args):
     )
 
     imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
-    run_tag = f"{args.model}_{imputation_label}_{args.feature_set}_w{args.window_size}"
+    run_tag = (f"{args.model}_{imputation_label}_{args.feature_set_tag}"
+               f"_w{args.window_size}_{args.fraction_tag}_{args.timestamp}")
     plot_calibration(y_true_all, y_pred_all, run_tag)
 
     print("\n" + "="*50)
@@ -688,8 +779,9 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
-    out_path = f"../results/{args.model}_{imputation_label}_{args.feature_set}_w{args.window_size}_{timestamp}.txt"
+    out_path = (f"../results/{args.model}_{imputation_label}_{args.feature_set_tag}"
+                f"_w{args.window_size}_{args.fraction_tag}_{args.timestamp}.txt")
     sys.stdout = open(out_path, "w", buffering=1)
     main(args)

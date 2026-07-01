@@ -204,7 +204,7 @@ catch22:
       feature: DN_HistogramMode_5
       candidates: [DN_HistogramMode_5, DN_HistogramMode_10]
     - axis: predictability        # autocorrelation timescale (first 1/e crossing)
-      feature: CO_f1ecac
+      feature: CO_f1ecac 
       candidates: [CO_f1ecac, CO_FirstMin_ac, SB_MotifThree_quantile_hh]
     - axis: nonlinearity          # time-irreversibility (rise/fall asymmetry)
       # FIXED axis (no symptom-tail direction). Normalized mean of (x_{t+1}-x_t)^3:

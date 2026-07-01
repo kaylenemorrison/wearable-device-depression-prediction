@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 from functools import reduce
@@ -21,6 +22,23 @@ PATH_TO_YAML = "../feature_spec.yaml"
 SIX_HOURS_SECONDS = 6 * 60 * 60
 
 GROUP_COLS = ['participant_name', 'timeInterval_ID']
+
+
+def dataset_stem(window_size: int, simple_present_fraction: float,
+                 catch22_present_fraction: float, catch22_enabled: bool) -> str:
+    """Filename stem encoding the window and BOTH present-fraction floors, so
+    datasets built at different floors live side by side instead of overwriting.
+    `sp` = simple-aggregation present fraction, `cp` = catch22 present fraction.
+
+    When catch22 is gated off for this window (catch22_enabled=False, i.e. window
+    not in enabled_window_sizes) the cp floor is inert, so it is recorded as
+    `cpNA` rather than a number -- this stops windows <14 from spawning
+    content-identical files that differ only by a meaningless cp value.
+    modeling.py reconstructs the same name (it derives catch22_enabled from
+    feature_spec.yaml) -- keep the two conventions in sync.
+    """
+    cp = f"{catch22_present_fraction:g}" if catch22_enabled else "NA"
+    return f"final_dataset_w{window_size}_sp{simple_present_fraction:g}_cp{cp}"
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +123,7 @@ def aggregate_stream(
     pipeline: dict[str, list[str]],
     stream_name: str,
     window_size: int,
-    missing_threshold: int,
+    min_present_fraction: float,
     derive: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Window a daily stream onto each PHQ-8 assessment and apply, per base
@@ -115,6 +133,10 @@ def aggregate_stream(
     columns follow "<stream>_<feature>_<op>". A single structural adherence
     count ("<stream>_missing_last<N>" = days with no row at all) is kept; the
     per-feature missing counts used for nulling are dropped before returning.
+
+    `min_present_fraction` is the floor on the fraction of window-days a feature
+    must have present (same convention as the catch22 panel): a feature whose
+    present fraction falls below it has its aggregates nulled for that window.
 
     `derive(window)` optionally adds derived daily columns (e.g. sleep_midpoint)
     that the pipeline references but the raw table does not contain.
@@ -161,11 +183,13 @@ def aggregate_stream(
     agg = agg.merge(miss, on=GROUP_COLS, how='left')
 
     # --- per-feature nulling -----------------------------------------------
-    # Null only the aggregates of features that exceeded the threshold, so a
-    # window with good data for most features keeps them even when one sparse
-    # column is over budget.
+    # Null only the aggregates of features below the present-fraction floor, so
+    # a window with good data for most features keeps them even when one sparse
+    # column is under budget. agg[feat] holds the per-feature missing-day count;
+    # convert to a present fraction so the test mirrors the catch22 panel.
     for feat in feats:
-        invalid = (agg[feat] > missing_threshold).to_numpy()
+        present_fraction = (window_size - agg[feat]) / window_size
+        invalid = (present_fraction < min_present_fraction).to_numpy()
         derived_cols = [f'{stream_name}_{feat}_{op}' for op in pipeline[feat]]
         agg.loc[invalid, derived_cols] = np.nan
 
@@ -188,10 +212,10 @@ def create_simple_aggs_sleep(
     sleep: pd.DataFrame,
     sleep_pipeline: dict[str, list[str]],
     window_size: int,
-    missing_threshold: int,
+    min_present_fraction: float,
 ) -> pd.DataFrame:
     return aggregate_stream(phq8, sleep, sleep_pipeline, 'sleep',
-                            window_size, missing_threshold, derive=_derive_sleep)
+                            window_size, min_present_fraction, derive=_derive_sleep)
 
 
 def create_simple_aggs_activity(
@@ -199,10 +223,10 @@ def create_simple_aggs_activity(
     activity: pd.DataFrame,
     activity_pipeline: dict[str, list[str]],
     window_size: int,
-    missing_threshold: int,
+    min_present_fraction: float,
 ) -> pd.DataFrame:
     return aggregate_stream(phq8, activity, activity_pipeline, 'activity',
-                            window_size, missing_threshold)
+                            window_size, min_present_fraction)
 
 
 def create_simple_aggs_steps(
@@ -210,10 +234,10 @@ def create_simple_aggs_steps(
     steps: pd.DataFrame,
     steps_pipeline: dict[str, list[str]],
     window_size: int,
-    missing_threshold: int,
+    min_present_fraction: float,
 ) -> pd.DataFrame:
     return aggregate_stream(phq8, steps, steps_pipeline, 'steps',
-                            window_size, missing_threshold)
+                            window_size, min_present_fraction)
 
 
 def create_simple_aggs_heartrate(
@@ -221,10 +245,10 @@ def create_simple_aggs_heartrate(
     heartrate: pd.DataFrame,
     heartrate_pipeline: dict[str, list[str]],
     window_size: int,
-    missing_threshold: int,
+    min_present_fraction: float,
 ) -> pd.DataFrame:
     return aggregate_stream(phq8, heartrate, heartrate_pipeline, 'heartrate',
-                            window_size, missing_threshold)
+                            window_size, min_present_fraction)
 
 
 # ---------------------------------------------------------------------------
@@ -368,13 +392,14 @@ def parse_args() -> argparse.Namespace:
         help="Window size for the aggregated features. Default: 14.",
     )
     parser.add_argument(
-        "--missing-threshold",
-        type=int,
+        "--min-present-fraction",
+        type=float,
         default=None,
         help=(
-            "Max missing days allowed before nulling a window. "
-            "Must be between 0 and floor(window_size/2) (inclusive), enforcing "
-            "50-100%% window completeness. Defaults to floor(window_size/2)."
+            "Min fraction of window-days a feature must have present before its "
+            "aggregates are nulled for that window (same convention as "
+            "--catch22-min-present-fraction). Must be between 0.5 and 1.0 "
+            "(inclusive), enforcing 50-100%% window completeness. Defaults to 0.75."
         ),
     )
     parser.add_argument(
@@ -390,15 +415,13 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
-    lower = 0
-    upper = args.window_size // 2
-    if args.missing_threshold is None:
-        args.missing_threshold = upper
-    elif not (lower <= args.missing_threshold <= upper):
+    if args.min_present_fraction is None:
+        args.min_present_fraction = 0.75
+    elif not (0.5 <= args.min_present_fraction <= 1.0):
         parser.error(
-            f"--missing-threshold must be between {lower} and {upper} "
-            f"for --window-size {args.window_size} (got {args.missing_threshold}); "
-            f"this enforces 50-100% window completeness"
+            f"--min-present-fraction must be between 0.5 and 1.0 "
+            f"(got {args.min_present_fraction}); this enforces 50-100% window "
+            f"completeness"
         )
 
     return args
@@ -440,7 +463,7 @@ def parse_yaml(
 def main() -> None:
     args = parse_args()
     window_size = args.window_size
-    missing_threshold = args.missing_threshold
+    min_present_fraction = args.min_present_fraction
 
     start = time.time()
 
@@ -448,7 +471,7 @@ def main() -> None:
         # Progress only: step names + shapes (metadata), never participant rows.
         print(f"[{time.time() - start:6.1f}s] {msg}", flush=True)
 
-    log(f"Starting merge | window_size={window_size}, missing_threshold={missing_threshold}")
+    log(f"Starting merge | window_size={window_size}, min_present_fraction={min_present_fraction}")
 
     log("Parsing feature spec...")
     (sleep_pipeline, heartrate_pipeline, activity_pipeline,
@@ -480,19 +503,19 @@ def main() -> None:
         f"steps={steps.shape}, heartrate={heartrate.shape}")
 
     log("Aggregating sleep...")
-    simple_sleep_agg = create_simple_aggs_sleep(phq8, sleep, sleep_pipeline, window_size, missing_threshold)
+    simple_sleep_agg = create_simple_aggs_sleep(phq8, sleep, sleep_pipeline, window_size, min_present_fraction)
     log(f"  sleep done -> {simple_sleep_agg.shape}")
 
     log("Aggregating activity...")
-    simple_activity_agg = create_simple_aggs_activity(phq8, activity, activity_pipeline, window_size, missing_threshold)
+    simple_activity_agg = create_simple_aggs_activity(phq8, activity, activity_pipeline, window_size, min_present_fraction)
     log(f"  activity done -> {simple_activity_agg.shape}")
 
     log("Aggregating steps...")
-    simple_steps_agg = create_simple_aggs_steps(phq8, steps, steps_pipeline, window_size, missing_threshold)
+    simple_steps_agg = create_simple_aggs_steps(phq8, steps, steps_pipeline, window_size, min_present_fraction)
     log(f"  steps done -> {simple_steps_agg.shape}")
 
     log("Aggregating heartrate...")
-    simple_heartrate_agg = create_simple_aggs_heartrate(phq8, heartrate, heartrate_pipeline, window_size, missing_threshold)
+    simple_heartrate_agg = create_simple_aggs_heartrate(phq8, heartrate, heartrate_pipeline, window_size, min_present_fraction)
     log(f"  heartrate done -> {simple_heartrate_agg.shape}")
 
     log("Aggregating catch22...")
@@ -537,10 +560,49 @@ def main() -> None:
 
     log(f"  final dataset -> {final_dataset.shape}")
 
+    # --- column manifest ----------------------------------------------------
+    # Emit a sidecar mapping each feature family to the columns it contributed,
+    # so modeling.py can select any subset of {demographics, simple, catch22}
+    # without re-deriving the naming convention. This is the producer's ground
+    # truth: it reflects the all-NaN drop above and catch22 window-gating (an
+    # empty list at window sizes where the panel is not produced). The adherence
+    # missingness counts (`*_missing_last{N}`) are folded into `simple` -- they
+    # come from the same aggregation pipeline and are not separately selectable.
+    present = set(final_dataset.columns)
+
+    def family_cols(frames: list[pd.DataFrame]) -> list[str]:
+        cols = []
+        for frame in frames:
+            cols += [c for c in frame.columns if c not in GROUP_COLS]
+        return [c for c in cols if c in present]
+
+    manifest = {
+        "window_size": window_size,
+        "min_present_fraction": min_present_fraction,
+        "catch22_min_present_fraction": catch22_min_present_fraction,
+        "target": [c for c in ["phq8_score"] if c in present],
+        "group": [c for c in ["participant_name"] if c in present],
+        "demographics": [c for c in demographics.columns
+                         if c != "participant_name" and c in present],
+        "simple": family_cols([simple_sleep_agg, simple_activity_agg,
+                                simple_steps_agg, simple_heartrate_agg]),
+        "catch22": family_cols([catch22_agg]),
+    }
+
     os.makedirs(PATH_TO_MERGED, exist_ok=True)
-    output_path = f"{PATH_TO_MERGED}/final_dataset_w{window_size}.parquet"
+    catch22_enabled = window_size in catch22_config.get('enabled_window_sizes', [])
+    stem = dataset_stem(window_size, min_present_fraction,
+                        catch22_min_present_fraction, catch22_enabled)
+    output_path = f"{PATH_TO_MERGED}/{stem}.parquet"
     final_dataset.to_parquet(output_path, engine='pyarrow', index=False)
     log(f"Wrote {output_path}")
+
+    manifest_path = f"{PATH_TO_MERGED}/{stem}_columns.json"
+    with open(manifest_path, 'w') as fh:
+        json.dump(manifest, fh, indent=2)
+    log(f"Wrote {manifest_path} "
+        f"(demographics={len(manifest['demographics'])}, "
+        f"simple={len(manifest['simple'])}, catch22={len(manifest['catch22'])})")
 
 
 if __name__ == "__main__":
