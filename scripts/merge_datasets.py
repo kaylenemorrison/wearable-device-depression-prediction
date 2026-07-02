@@ -117,6 +117,61 @@ OP_DISPATCH = {
 # ---------------------------------------------------------------------------
 # Generic, profile-driven simple aggregation
 # ---------------------------------------------------------------------------
+def _compute_adherence_indicators(
+    phq8: pd.DataFrame,
+    stream: pd.DataFrame,
+    stream_name: str,
+    window_size: int,
+) -> pd.DataFrame:
+    """Compute adherence indicators for a stream:
+    - Days with no data at all (structural count): '<stream_name>_missing_last<window_size>'
+    - Maximum consecutive missing days: '<stream_name>_missing_consecutive_max'
+    """
+    window = create_window(phq8, window_size)
+    stream = stream.rename(columns={'timeInterval_ID': 'timeInterval_ID_stream'})
+
+    window = window.merge(
+        stream,
+        left_on=['participant_name', 'timeInterval_ID_window'],
+        right_on=['participant_name', 'timeInterval_ID_stream'],
+        how='left',
+    )
+
+    # Compute structural count: days with no row at all
+    window['_row_absent'] = window['timeInterval_ID_stream'].isna().astype(int)
+    structural = (
+        window.groupby(GROUP_COLS)['_row_absent']
+        .sum()
+        .reset_index(name=f'{stream_name}_missing_last{window_size}')
+    )
+
+    # Compute max consecutive missing days
+    def max_consecutive_missing(group):
+        """Find the longest streak of consecutive missing days in a window."""
+        is_missing = group['_row_absent'].values
+        if len(is_missing) == 0:
+            return 0
+        max_streak = 0
+        current_streak = 0
+        for missing in is_missing:
+            if missing:
+                current_streak += 1
+                max_streak = max(max_streak, current_streak)
+            else:
+                current_streak = 0
+        return max_streak
+
+    consecutive = (
+        window.groupby(GROUP_COLS)
+        .apply(max_consecutive_missing, include_groups=False)
+        .reset_index(name=f'{stream_name}_missing_consecutive_max')
+    )
+
+    # Merge both indicators
+    result = structural.merge(consecutive, on=GROUP_COLS, how='left')
+    return result
+
+
 def aggregate_stream(
     phq8: pd.DataFrame,
     stream: pd.DataFrame,
@@ -130,9 +185,8 @@ def aggregate_stream(
     feature, only the aggregation operations its YAML profile assigns.
 
     `pipeline` is {feature_name: [op, ...]} produced by parse_yaml. Output
-    columns follow "<stream>_<feature>_<op>". A single structural adherence
-    count ("<stream>_missing_last<N>" = days with no row at all) is kept; the
-    per-feature missing counts used for nulling are dropped before returning.
+    columns follow "<stream>_<feature>_<op>". Per-feature missing counts used
+    for nulling are dropped before returning.
 
     `min_present_fraction` is the floor on the fraction of window-days a feature
     must have present (same convention as the catch22 panel): a feature whose
@@ -155,15 +209,6 @@ def aggregate_stream(
         window = derive(window)
 
     feats = list(pipeline.keys())
-
-    # --- structural (day-level) missing count, kept as a feature -----------
-    # Days in the window with no row at all = device non-wear / absence.
-    window['_row_absent'] = window['timeInterval_ID_stream'].isna().astype(int)
-    structural_counts = (
-        window.groupby(GROUP_COLS)['_row_absent']
-        .sum()
-        .reset_index(name=f'{stream_name}_missing_last{window_size}')
-    )
 
     # --- profile-driven aggregations ---------------------------------------
     # Each feature contributes only the ops its profile lists, named
@@ -193,9 +238,8 @@ def aggregate_stream(
         derived_cols = [f'{stream_name}_{feat}_{op}' for op in pipeline[feat]]
         agg.loc[invalid, derived_cols] = np.nan
 
-    # Drop the per-feature counts; keep only the single structural count.
+    # Drop the per-feature counts.
     agg = agg.drop(columns=feats)
-    agg = agg.merge(structural_counts, on=GROUP_COLS, how='left')
 
     return agg
 
@@ -252,6 +296,25 @@ def create_simple_aggs_heartrate(
 
 
 # ---------------------------------------------------------------------------
+# Adherence indicators (optional feature set)
+# ---------------------------------------------------------------------------
+def create_adherence_sleep(phq8: pd.DataFrame, sleep: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    return _compute_adherence_indicators(phq8, sleep, 'sleep', window_size)
+
+
+def create_adherence_activity(phq8: pd.DataFrame, activity: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    return _compute_adherence_indicators(phq8, activity, 'activity', window_size)
+
+
+def create_adherence_steps(phq8: pd.DataFrame, steps: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    return _compute_adherence_indicators(phq8, steps, 'steps', window_size)
+
+
+def create_adherence_heartrate(phq8: pd.DataFrame, heartrate: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    return _compute_adherence_indicators(phq8, heartrate, 'heartrate', window_size)
+
+
+# ---------------------------------------------------------------------------
 # catch22 panel
 # ---------------------------------------------------------------------------
 def _resolve_panel(panel: list[dict], symptom_tail: str) -> list[str]:
@@ -293,7 +356,7 @@ def _catch22_panel_values(
     series is z-normalized, and each panel feature is evaluated."""
     series = np.asarray(series, dtype=float)
     present = int(np.isfinite(series).sum())
-    if present < 2 or present / window_size < min_present_fraction:
+    if present / window_size < min_present_fraction:
         return [np.nan] * len(feature_names)
 
     filled = (
@@ -523,12 +586,23 @@ def main() -> None:
                                       window_size, min_present_fraction=catch22_min_present_fraction)
     log(f"  catch22 done -> {catch22_agg.shape}")
 
+    log("Computing structural adherence counts...")
+    adherence_sleep = create_adherence_sleep(phq8, sleep, window_size)
+    adherence_activity = create_adherence_activity(phq8, activity, window_size)
+    adherence_steps = create_adherence_steps(phq8, steps, window_size)
+    adherence_heartrate = create_adherence_heartrate(phq8, heartrate, window_size)
+    log(f"  adherence done")
+
     agg_list = [
         simple_sleep_agg,
         simple_activity_agg,
         simple_steps_agg,
         simple_heartrate_agg,
         catch22_agg,
+        adherence_sleep,
+        adherence_activity,
+        adherence_steps,
+        adherence_heartrate,
     ]
 
     log("Merging stream aggregations...")
@@ -562,12 +636,10 @@ def main() -> None:
 
     # --- column manifest ----------------------------------------------------
     # Emit a sidecar mapping each feature family to the columns it contributed,
-    # so modeling.py can select any subset of {demographics, simple, catch22}
+    # so modeling.py can select any subset of {demographics, simple, catch22, adherence}
     # without re-deriving the naming convention. This is the producer's ground
     # truth: it reflects the all-NaN drop above and catch22 window-gating (an
-    # empty list at window sizes where the panel is not produced). The adherence
-    # missingness counts (`*_missing_last{N}`) are folded into `simple` -- they
-    # come from the same aggregation pipeline and are not separately selectable.
+    # empty list at window sizes where the panel is not produced).
     present = set(final_dataset.columns)
 
     def family_cols(frames: list[pd.DataFrame]) -> list[str]:
@@ -587,6 +659,8 @@ def main() -> None:
         "simple": family_cols([simple_sleep_agg, simple_activity_agg,
                                 simple_steps_agg, simple_heartrate_agg]),
         "catch22": family_cols([catch22_agg]),
+        "adherence": family_cols([adherence_sleep, adherence_activity,
+                                   adherence_steps, adherence_heartrate]),
     }
 
     os.makedirs(PATH_TO_MERGED, exist_ok=True)
