@@ -33,20 +33,20 @@ PATH_TO_YAML = "../feature_spec.yaml"
 def catch22_enabled_windows():
     """Window sizes for which the catch22 panel is produced, read from the
     feature spec so modeling.py and merge_datasets.py agree on the gating (and
-    thus on the cp/cpNA filename tag) without hardcoding the set in two places."""
+    thus on the c22/noc22 filename tag) without hardcoding the set in two places."""
     with open(PATH_TO_YAML) as fh:
         spec = yaml.safe_load(fh)
     return spec.get("catch22", {}).get("enabled_window_sizes", [])
 
-def dataset_stem(window_size, simple_present_fraction, catch22_present_fraction,
-                 catch22_enabled):
+def dataset_stem(window_size, min_present_fraction, catch22_enabled):
     """Filename stem for a merged dataset, mirroring merge_datasets.dataset_stem.
-    `sp` = simple-aggregation present fraction, `cp` = catch22 present fraction;
-    cp is recorded as NA when catch22 is gated off for this window. Must stay in
-    sync with merge_datasets.py so the right parquet/manifest load.
+    `mp` = the single present-fraction floor shared by the simple aggregations
+    and the catch22 panel; the `c22`/`noc22` tag records whether the catch22
+    panel is present for this window. Must stay in sync with merge_datasets.py so
+    the right parquet/manifest load.
     """
-    cp = f"{catch22_present_fraction:g}" if catch22_enabled else "NA"
-    return f"final_dataset_w{window_size}_sp{simple_present_fraction:g}_cp{cp}"
+    c22 = "c22" if catch22_enabled else "noc22"
+    return f"final_dataset_w{window_size}_mp{min_present_fraction:g}_{c22}"
 
 def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
     """Split df into (X, y, groups) and encode the categorical/boolean columns.
@@ -411,19 +411,10 @@ def parse_args():
         type=float,
         default=0.75,
         help=(
-            "Present-fraction floor of the SIMPLE aggregations to load (the `sp` "
-            "in the merged filename). Selects which merge_datasets.py output to "
-            "model on; must match an existing dataset. Default: 0.75."
-        ),
-    )
-    parser.add_argument(
-        "--catch22-min-present-fraction",
-        type=float,
-        default=0.75,
-        help=(
-            "Present-fraction floor of the CATCH22 panel to load (the `cp` in the "
-            "merged filename). Selects which merge_datasets.py output to model on; "
-            "must match an existing dataset. Default: 0.75."
+            "Present-fraction floor of the merged dataset to load (the `mp` in the "
+            "filename), shared by the simple aggregations and the catch22 panel. "
+            "Selects which merge_datasets.py output to model on; must match an "
+            "existing dataset. Default: 0.75."
         ),
     )
     parser.add_argument(
@@ -446,15 +437,14 @@ def parse_args():
     args.feature_set = [f for f in family_order if f in args.feature_set]
     args.feature_set_tag = "+".join(args.feature_set)
 
-    # No numeric range check on the fractions: they only pick which generated
+    # No numeric range check on the fraction: it only picks which generated
     # dataset to load, so the file-existence check in main() is the real guard
     # (it also handles valid-but-not-yet-built fractions, and lists what exists).
-    # cp is recorded as NA when catch22 is gated off for this window, matching
-    # merge_datasets.dataset_stem so the loaded filename lines up.
+    # The c22/noc22 tag records whether catch22 is produced for this window,
+    # matching merge_datasets.dataset_stem so the loaded filename lines up.
     args.catch22_enabled = args.window_size in catch22_enabled_windows()
-    _cp = (f"{args.catch22_min_present_fraction:g}"
-           if args.catch22_enabled else "NA")
-    args.fraction_tag = f"sp{args.min_present_fraction:g}_cp{_cp}"
+    _c22 = "c22" if args.catch22_enabled else "noc22"
+    args.fraction_tag = f"mp{args.min_present_fraction:g}_{_c22}"
 
     # XGBoost handles missing values natively; imputation must not be applied.
     if args.model == "xgboost":
@@ -482,8 +472,8 @@ def main(args):
     print("="*50)
     print(f"  Feature set:  {args.feature_set_tag}  ({', '.join(args.feature_set)})")
     print(f"  Window size:  {args.window_size}")
-    print(f"  Present frac: simple={args.min_present_fraction:g}, "
-          f"catch22={args.catch22_min_present_fraction:g}")
+    print(f"  Present frac: {args.min_present_fraction:g} "
+          f"(catch22 {'present' if args.catch22_enabled else 'absent'})")
     if args.model == "xgboost":
         print(f"  Imputation:   none (native NaN handling)")
     else:
@@ -494,13 +484,13 @@ def main(args):
     log(f"Run: {args.model} | {args.imputation} | {args.feature_set_tag} | "
         f"w{args.window_size} | {args.fraction_tag}")
 
-    # The dataset to load is identified by window + both present-fraction floors
-    # (sp/cp). The fractions only select a file, so file existence is the guard:
-    # a missing dataset (out-of-range OR valid-but-not-yet-built) errors with the
-    # list of what exists and the exact command to generate this one.
+    # The dataset to load is identified by window + the single present-fraction
+    # floor (mp) + the catch22 regime. The fraction only selects a file, so file
+    # existence is the guard: a missing dataset (out-of-range OR valid-but-not-yet
+    # -built) errors with the list of what exists and the command to generate it.
     data_dir = "../data_merged"
     stem = dataset_stem(args.window_size, args.min_present_fraction,
-                        args.catch22_min_present_fraction, args.catch22_enabled)
+                        args.catch22_enabled)
     data_path = f"{data_dir}/{stem}.parquet"
     manifest_path = f"{data_dir}/{stem}_columns.json"
 
@@ -515,8 +505,7 @@ def main(args):
             f"Available:\n  {listing}\n"
             f"Generate it with: python merge_datasets.py "
             f"--window-size {args.window_size} "
-            f"--min-present-fraction {args.min_present_fraction:g} "
-            f"--catch22-min-present-fraction {args.catch22_min_present_fraction:g}"
+            f"--min-present-fraction {args.min_present_fraction:g}"
         )
 
     df = pd.read_parquet(data_path)

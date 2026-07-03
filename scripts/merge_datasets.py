@@ -23,22 +23,39 @@ SIX_HOURS_SECONDS = 6 * 60 * 60
 
 GROUP_COLS = ['participant_name', 'timeInterval_ID']
 
+# catch22 panels are nulled for a window whose longest run of consecutive
+# missing days exceeds this, even if the window clears min_present_fraction: a
+# long contiguous gap can only be filled by interpolating a multi-day ramp, i.e.
+# fabricated dynamics, which corrupts the (spacing/adjacency-sensitive) catch22
+# axes. This gate is on CONSECUTIVE missingness only; scattered gaps up to the
+# present-fraction budget are still interpolated.
+# Deliberately a FLAT 2 at every window size (not scaled to the window): the
+# threshold is set by the SMALLEST catch22 window (14), where a run longer than
+# 2 interpolated days is already an unreasonable share of the series to
+# fabricate. A larger window does not justify a longer contiguous fabricated
+# stretch, so the same cap holds at 21/28.
+MAX_CATCH22_CONSECUTIVE_MISSING = 2
 
-def dataset_stem(window_size: int, simple_present_fraction: float,
-                 catch22_present_fraction: float, catch22_enabled: bool) -> str:
-    """Filename stem encoding the window and BOTH present-fraction floors, so
-    datasets built at different floors live side by side instead of overwriting.
-    `sp` = simple-aggregation present fraction, `cp` = catch22 present fraction.
 
-    When catch22 is gated off for this window (catch22_enabled=False, i.e. window
-    not in enabled_window_sizes) the cp floor is inert, so it is recorded as
-    `cpNA` rather than a number -- this stops windows <14 from spawning
-    content-identical files that differ only by a meaningless cp value.
+def dataset_stem(window_size: int, min_present_fraction: float,
+                 catch22_enabled: bool) -> str:
+    """Filename stem encoding every choice that determines the dataset's content,
+    so it is fully identifiable from the name and datasets built at different
+    settings live side by side instead of overwriting:
+      - `w{N}`   window size
+      - `mp{x}`  the single present-fraction floor, shared by the simple
+                 aggregations and the catch22 panel
+      - `c22` / `noc22`  whether the catch22 panel is present (gated on the
+                 window via enabled_window_sizes). This is derivable from the
+                 window, but is spelled out so the catch22 regime -- which also
+                 sets the min allowed `mp` floor -- is readable without consulting
+                 feature_spec.yaml.
+
     modeling.py reconstructs the same name (it derives catch22_enabled from
     feature_spec.yaml) -- keep the two conventions in sync.
     """
-    cp = f"{catch22_present_fraction:g}" if catch22_enabled else "NA"
-    return f"final_dataset_w{window_size}_sp{simple_present_fraction:g}_cp{cp}"
+    c22 = "c22" if catch22_enabled else "noc22"
+    return f"final_dataset_w{window_size}_mp{min_present_fraction:g}_{c22}"
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +358,17 @@ def _zscore(arr: np.ndarray) -> np.ndarray | None:
     return (arr - np.nanmean(arr)) / sd
 
 
+def _longest_missing_run(series: np.ndarray) -> int:
+    """Longest run of consecutive missing (NaN) days in a chronological series."""
+    is_missing = ~np.isfinite(np.asarray(series, dtype=float))
+    max_streak = current = 0
+    for missing in is_missing:
+        current = current + 1 if missing else 0
+        if current > max_streak:
+            max_streak = current
+    return max_streak
+
+
 def _catch22_panel_values(
     series: np.ndarray,
     feature_names: list[str],
@@ -350,13 +378,19 @@ def _catch22_panel_values(
     """Compute one base signal's panel over a single window.
 
     `series` is the window's daily values in chronological order (length
-    window_size, NaN for missing days). Below the min-present fraction the
-    window is too fabricated to read as dynamics, so an all-NaN block is
-    returned; otherwise missing days are interpolated to fix the length, the
-    series is z-normalized, and each panel feature is evaluated."""
+    window_size, NaN for missing days). An all-NaN block is returned (the panel
+    is nulled for this window) when EITHER the present fraction is below the
+    floor OR the longest run of consecutive missing days exceeds
+    MAX_CATCH22_CONSECUTIVE_MISSING -- both signal a series too fabricated to
+    read as dynamics. Otherwise the remaining (scattered) missing days are
+    interpolated to fix the length, the series is z-normalized, and each panel
+    feature is evaluated."""
     series = np.asarray(series, dtype=float)
     present = int(np.isfinite(series).sum())
     if present / window_size < min_present_fraction:
+        return [np.nan] * len(feature_names)
+
+    if _longest_missing_run(series) > MAX_CATCH22_CONSECUTIVE_MISSING:
         return [np.nan] * len(feature_names)
 
     filled = (
@@ -385,17 +419,21 @@ def create_catch22_aggs(
     heartrate: pd.DataFrame,
     catch22_cfg: dict,
     window_size: int,
+    enabled: bool,
     min_present_fraction: float | None = None,
 ) -> pd.DataFrame:
     """Apply the fixed, axis-diverse catch22 panel to the configured base
-    signals. Gated to long-enough windows (enabled_window_sizes); for excluded
-    windows it returns just the keys so the downstream merge is a no-op.
+    signals. `enabled` is computed once by the caller from the YAML window
+    gating (enabled_window_sizes); when False this returns just the keys so the
+    downstream merge is a no-op -- this is the single place that decision is
+    made, so it can't drift from the dataset_stem/min_present_fraction-floor
+    logic that also depends on it.
 
     `min_present_fraction` overrides the YAML floor when provided (validated by
     the caller to be no looser than the config floor)."""
     keys = phq8[GROUP_COLS].drop_duplicates().reset_index(drop=True)
 
-    if window_size not in catch22_cfg.get('enabled_window_sizes', []):
+    if not enabled:
         return keys.copy()
 
     if min_present_fraction is None:
@@ -459,35 +497,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Min fraction of window-days a feature must have present before its "
-            "aggregates are nulled for that window (same convention as "
-            "--catch22-min-present-fraction). Must be between 0.5 and 1.0 "
-            "(inclusive), enforcing 50-100%% window completeness. Defaults to 0.75."
+            "Single present-fraction floor shared by the simple aggregations and "
+            "the catch22 panel: the min fraction of window-days a feature must "
+            "have present before its aggregates are nulled (and, for catch22, the "
+            "min fraction of real days before the panel is all-NaN). Its allowed "
+            "minimum depends on whether catch22 is produced for this window: when "
+            "catch22 is present (window in enabled_window_sizes) it must be at "
+            "least the catch22 floor in feature_spec.yaml; otherwise it may go as "
+            "low as 0.5. Upper bound 1.0 either way. Defaults to 0.75."
         ),
     )
-    parser.add_argument(
-        "--catch22-min-present-fraction",
-        type=float,
-        default=None,
-        help=(
-            "Min fraction of real (non-interpolated) days a window must have for "
-            "its catch22 panel to be computed; below it the panel is all-NaN. "
-            "May only TIGHTEN the floor in feature_spec.yaml: must be between that "
-            "floor and 1.0 (inclusive). Defaults to the config floor."
-        ),
-    )
-    args = parser.parse_args()
-
-    if args.min_present_fraction is None:
-        args.min_present_fraction = 0.75
-    elif not (0.5 <= args.min_present_fraction <= 1.0):
-        parser.error(
-            f"--min-present-fraction must be between 0.5 and 1.0 "
-            f"(got {args.min_present_fraction}); this enforces 50-100% window "
-            f"completeness"
-        )
-
-    return args
+    # Range is validated in main(), where the YAML catch22 floor and this
+    # window's catch22 gating are known (the allowed minimum depends on both).
+    return parser.parse_args()
 
 
 def parse_yaml(
@@ -526,7 +548,6 @@ def parse_yaml(
 def main() -> None:
     args = parse_args()
     window_size = args.window_size
-    min_present_fraction = args.min_present_fraction
 
     start = time.time()
 
@@ -534,25 +555,37 @@ def main() -> None:
         # Progress only: step names + shapes (metadata), never participant rows.
         print(f"[{time.time() - start:6.1f}s] {msg}", flush=True)
 
-    log(f"Starting merge | window_size={window_size}, min_present_fraction={min_present_fraction}")
-
     log("Parsing feature spec...")
     (sleep_pipeline, heartrate_pipeline, activity_pipeline,
      steps_pipeline, catch22_config) = parse_yaml(PATH_TO_YAML)
 
-    # The config floor is the loosest catch22 coverage permitted; a CLI value may
-    # only tighten it (require more real days), never loosen it.
+    # A single present-fraction floor drives both the simple aggregations and the
+    # catch22 panel. Its allowed minimum depends on whether catch22 is produced
+    # for this window: when the catch22 panel is present, the floor must be at
+    # least the (stricter) catch22 floor in feature_spec.yaml, since the same
+    # value also caps how much of each series may be interpolated; when catch22 is
+    # gated off, the panel imposes no constraint and the floor may go as low as
+    # 0.5 (the simple-aggregation minimum). Upper bound is 1.0 either way.
+    catch22_enabled = window_size in catch22_config.get('enabled_window_sizes', [])
     catch22_floor = catch22_config.get('min_present_fraction', 0.75)
-    catch22_min_present_fraction = args.catch22_min_present_fraction
-    if catch22_min_present_fraction is None:
-        catch22_min_present_fraction = catch22_floor
-    elif not (catch22_floor <= catch22_min_present_fraction <= 1.0):
+    lower_bound = catch22_floor if catch22_enabled else 0.5
+
+    min_present_fraction = args.min_present_fraction
+    if min_present_fraction is None:
+        min_present_fraction = 0.75
+    elif not (lower_bound <= min_present_fraction <= 1.0):
         raise SystemExit(
-            f"--catch22-min-present-fraction must be between the config floor "
-            f"{catch22_floor} and 1.0 (got {catch22_min_present_fraction})"
+            f"--min-present-fraction must be between {lower_bound} and 1.0 "
+            f"(got {min_present_fraction}); the minimum is "
+            + (f"the catch22 floor {catch22_floor} because the catch22 panel is "
+               f"produced at window {window_size}"
+               if catch22_enabled else
+               f"0.5 because catch22 is not produced at window {window_size}")
         )
-    log(f"  catch22 min_present_fraction={catch22_min_present_fraction} "
-        f"(config floor={catch22_floor})")
+
+    log(f"Starting merge | window_size={window_size}, "
+        f"min_present_fraction={min_present_fraction}, catch22_enabled={catch22_enabled} "
+        f"(allowed floor >= {lower_bound})")
 
     # read cleaned datasets; PHQ8 and the wearable streams remain CSVs, demographics is parquet to preserve categorical metadata
     log("Reading cleaned datasets...")
@@ -583,7 +616,7 @@ def main() -> None:
 
     log("Aggregating catch22...")
     catch22_agg = create_catch22_aggs(phq8, sleep, activity, steps, heartrate, catch22_config,
-                                      window_size, min_present_fraction=catch22_min_present_fraction)
+                                      window_size, catch22_enabled, min_present_fraction=min_present_fraction)
     log(f"  catch22 done -> {catch22_agg.shape}")
 
     log("Computing structural adherence counts...")
@@ -632,14 +665,10 @@ def main() -> None:
         final_dataset = final_dataset.drop(columns=all_nan_cols)
         log(f"  dropped {len(all_nan_cols)} all-NaN columns: {all_nan_cols}")
 
-    log(f"  final dataset -> {final_dataset.shape}")
+    log(f"  after column drop -> {final_dataset.shape}")
 
-    # --- column manifest ----------------------------------------------------
-    # Emit a sidecar mapping each feature family to the columns it contributed,
-    # so modeling.py can select any subset of {demographics, simple, catch22, adherence}
-    # without re-deriving the naming convention. This is the producer's ground
-    # truth: it reflects the all-NaN drop above and catch22 window-gating (an
-    # empty list at window sizes where the panel is not produced).
+    # Resolve family -> columns now (post column-drop) so both the row filter
+    # below and the manifest use the same, final column lists.
     present = set(final_dataset.columns)
 
     def family_cols(frames: list[pd.DataFrame]) -> list[str]:
@@ -648,25 +677,48 @@ def main() -> None:
             cols += [c for c in frame.columns if c not in GROUP_COLS]
         return [c for c in cols if c in present]
 
+    simple_cols = family_cols([simple_sleep_agg, simple_activity_agg,
+                                simple_steps_agg, simple_heartrate_agg])
+    catch22_cols = family_cols([catch22_agg])
+
+    # Drop windows (PHQ-8 assessment rows) with zero wearable signal: every
+    # simple aggregate AND every catch22 feature is NaN. These rows carry no
+    # simple/catch22 information regardless of imputation strategy, so keeping
+    # them only pads the row count with pure noise for those two families.
+    # (catch22_cols is empty when the panel isn't produced for this window, so
+    # the check correctly reduces to "all simple features NaN" there.)
+    check_cols = simple_cols + catch22_cols
+    if check_cols:
+        fully_missing = final_dataset[check_cols].isna().all(axis=1)
+        n_dropped = int(fully_missing.sum())
+        if n_dropped:
+            final_dataset = final_dataset.loc[~fully_missing].reset_index(drop=True)
+            log(f"  dropped {n_dropped} rows with all simple+catch22 features NaN")
+
+    log(f"  final dataset -> {final_dataset.shape}")
+
+    # --- column manifest ----------------------------------------------------
+    # Emit a sidecar mapping each feature family to the columns it contributed,
+    # so modeling.py can select any subset of {demographics, simple, catch22, adherence}
+    # without re-deriving the naming convention. This is the producer's ground
+    # truth: it reflects the all-NaN column drop and catch22 window-gating (an
+    # empty list at window sizes where the panel is not produced).
     manifest = {
         "window_size": window_size,
         "min_present_fraction": min_present_fraction,
-        "catch22_min_present_fraction": catch22_min_present_fraction,
+        "catch22_enabled": catch22_enabled,
         "target": [c for c in ["phq8_score"] if c in present],
         "group": [c for c in ["participant_name"] if c in present],
         "demographics": [c for c in demographics.columns
                          if c != "participant_name" and c in present],
-        "simple": family_cols([simple_sleep_agg, simple_activity_agg,
-                                simple_steps_agg, simple_heartrate_agg]),
-        "catch22": family_cols([catch22_agg]),
+        "simple": simple_cols,
+        "catch22": catch22_cols,
         "adherence": family_cols([adherence_sleep, adherence_activity,
                                    adherence_steps, adherence_heartrate]),
     }
 
     os.makedirs(PATH_TO_MERGED, exist_ok=True)
-    catch22_enabled = window_size in catch22_config.get('enabled_window_sizes', [])
-    stem = dataset_stem(window_size, min_present_fraction,
-                        catch22_min_present_fraction, catch22_enabled)
+    stem = dataset_stem(window_size, min_present_fraction, catch22_enabled)
     output_path = f"{PATH_TO_MERGED}/{stem}.parquet"
     final_dataset.to_parquet(output_path, engine='pyarrow', index=False)
     log(f"Wrote {output_path}")

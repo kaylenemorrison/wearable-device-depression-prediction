@@ -158,6 +158,26 @@ catch22:
                                   # Per-row, uses only that window's own days ->
                                   # not CV leakage. Alternative "drop" gives a
                                   # variable-length series with distorted spacing.
+                                  #
+                                  # SECOND gate on top of min_present_fraction:
+                                  # a window is also nulled if its LONGEST RUN of
+                                  # consecutive missing days exceeds 2 (i.e. 3+ in
+                                  # a row), even when it clears the present
+                                  # fraction. min_present_fraction bounds TOTAL
+                                  # (possibly scattered) missingness; this bounds
+                                  # CONTIGUOUS missingness, because interpolating
+                                  # across a long gap fabricates a multi-day ramp
+                                  # -- fake dynamics that corrupt the spacing/
+                                  # adjacency-sensitive catch22 axes. Scattered
+                                  # gaps up to the fraction budget are still
+                                  # interpolated. The cap is a FLAT 2 at every
+                                  # window size, set by the smallest window (14)
+                                  # where >2 fabricated days in a row is already
+                                  # an unreasonable share; a larger window does
+                                  # not justify a longer fabricated stretch. Lives
+                                  # as MAX_CATCH22_CONSECUTIVE_MISSING in
+                                  # merge_datasets.py (a code constant, not a
+                                  # tunable here).
 
   # --- panel selection (OUTCOME-BLIND) -----------------------------------
   # Picked from catch22_shortseries_test.py survivors at length 14 -- the SHORTEST
