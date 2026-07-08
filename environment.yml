@@ -10,6 +10,7 @@ dependencies:
     - missforest
     - optuna
     - pycatch22
+    - shap
   - pandas
   - numpy
   - scipy

@@ -16,9 +16,12 @@
 # split determines which HRV/quality columns physically exist.
 
 meta:
-  basic_feature_count: 76     # see per-stream subtotals below
-  catch22_feature_count: ~40  # fixed panel (~5) x base set (8); see `catch22:`
-  total_target: ~116          # headroom under the ~120 cap
+  demographic_raw: 4                           # raw predictor columns: age, gender, mh_smoking, audit_1 (phq8_score is outcome)
+  demographic_feature_count: 8                 # after one-hot: age(1) + gender(1, binary) + mh_smoking(2, 3 levels-1) + audit_1(4, 5 levels-1)
+  basic_feature_count: 76                      # see per-stream subtotals below
+  catch22_feature_count: 45                    # fixed panel (5) x base set (9); see `catch22:`
+  adherence_feature_count: 8                   # missing_last + missing_consecutive_max per stream (4 streams)
+  total_feature_count: 137                     # demographics(8) + basic(76) + catch22(45) + adherence(8)
 
   # Output naming convention (matches merge_datasets.py): "<stream>_<col>_<stat>".
   # mean is intentionally DROPPED where median is present (collinear); median is
@@ -109,18 +112,22 @@ steps:
   # FEATURE_006 (mean steps/min) dropped: collinear with FEATURE_001 total.
 
 # ===========================================================================
-# ADHERENCE  (subtotal: 4)  — already produced by merge_datasets.py
+# ADHERENCE  (subtotal: 8)  — already produced by merge_datasets.py
 # ===========================================================================
 adherence:
-  - sleep_missing_last{N}       # structural (row-absent) day count per stream
+  - sleep_missing_last{N}              # days with no data in window per stream
+  - sleep_missing_consecutive_max      # longest consecutive missing-data streak
   - activity_missing_last{N}
+  - activity_missing_consecutive_max
   - steps_missing_last{N}
+  - steps_missing_consecutive_max
   - heartrate_missing_last{N}
+  - heartrate_missing_consecutive_max
 
 # ===========================================================================
 # catch22 configuration  (SINGLE source of truth for all catch22 columns)
 #
-# Model: a FIXED PANEL of ~5 catch22 features, each capturing a DISTINCT
+# Model: a FIXED PANEL of 5 catch22 features, each capturing a DISTINCT
 # dynamical axis, applied across a BROAD set of base signals -- rather than the
 # full survivable subset on a few signals. Rationale: at these short lengths the
 # survivable features are mostly distributional and redundant with one another,
@@ -128,7 +135,7 @@ adherence:
 # panel across more signals buys more independent dynamical information, and the
 # basic aggregations already cover level/spread.
 #
-# Budget: ~5 panel features x 8 base signals ~= 40.
+# Budget: 5 panel features x 8 base signals = 40.
 # ===========================================================================
 catch22:
   # --- gating ------------------------------------------------------------
@@ -191,16 +198,12 @@ catch22:
   # to the model's regularization (elastic-net L2). NEVER select by correlation
   # with PHQ-8 (leakage).
   #
-  # Two of the five axes (outlier_extreme, persistence_run) are DIRECTION-SENSITIVE
-  # and pick their variant per base signal from a single `symptom_tail: high|low`
-  # flag (see base_features) -- the same outcome-blind, domain-driven rule used to
-  # pick level_low/total_low (+min) vs level_high (+max) in the basic profiles.
-  # This is ONE clinical decision per signal (which tail is pathological) driving
-  # both direction-sensitive axes; the other three axes (distribution_shape,
-  # predictability, nonlinearity) are identical across every signal and window.
-  # Variant choice is by physiology only, NEVER by PHQ-8 correlation (no leakage).
-  # Same window treatment everywhere (comparability).
-  panel_size: 5
+  # One axis (outlier_extreme) is DIRECTION-SENSITIVE and picks its variant per
+  # base signal from a single `symptom_tail: high|low` flag (see base_features);
+  # the other four axes (distribution_shape, predictability, successive_differences,
+  # mutual_information) are identical across every signal and window. Variant choice
+  # is by physiology only, NEVER by PHQ-8 correlation (no leakage).
+  panel_size: 5  # outlier_extreme, distribution_shape, predictability, successive_differences, mutual_information
   panel_source: "catch22_shortseries_test.py @ length=14 (shortest enabled window; picks valid at 21/28)"
   panel:
     - axis: outlier_extreme       # extreme-event / tail structure
@@ -210,31 +213,18 @@ catch22:
       feature: DN_OutlierInclude_{p_if_high_else_n}_001_mdrmd
       select_by: symptom_tail     # high->p, low->n
       candidates: [DN_OutlierInclude_p_001_mdrmd, DN_OutlierInclude_n_001_mdrmd]
-    - axis: persistence_run       # sustained-regime persistence
-      # VARIANT-SELECTED PER BASE SIGNAL by base_features `symptom_tail`:
-      #   high -> SB_BinaryStats_mean_longstretch1  (longest ABOVE-mean run =
-      #           stuck in a sustained elevated/symptom state)
-      #   low  -> SB_BinaryStats_diff_longstretch0  (longest sustained DECLINE;
-      #           catch22 has no below-mean longstretch, so this is the closest
-      #           "progressive worsening" proxy for low-symptom signals)
-      feature: SB_BinaryStats_{mean_longstretch1_if_high_else_diff_longstretch0}
-      select_by: symptom_tail     # high->mean_longstretch1, low->diff_longstretch0
-      candidates: [SB_BinaryStats_mean_longstretch1, SB_BinaryStats_diff_longstretch0]
     - axis: distribution_shape    # marginal shape / modal structure
       feature: DN_HistogramMode_5
       candidates: [DN_HistogramMode_5, DN_HistogramMode_10]
-    - axis: predictability        # autocorrelation timescale (first 1/e crossing)
-      feature: CO_f1ecac 
-      candidates: [CO_f1ecac, CO_FirstMin_ac, SB_MotifThree_quantile_hh]
-    - axis: nonlinearity          # time-irreversibility (rise/fall asymmetry)
-      # FIXED axis (no symptom-tail direction). Normalized mean of (x_{t+1}-x_t)^3:
-      # captures NONLINEAR time-irreversibility -- asymmetry between sharp rises and
-      # slow decays (or vice versa). The only NONLINEAR axis here; the other four are
-      # linear/distributional, so it is the most orthogonal panel addition (more so
-      # than entropy_pairs/SB_MotifThree_quantile_hh, which overlaps `predictability`).
-      # Survives at EVERY tested length, incl. N=3 (catch22_shortseries_test.py).
-      feature: CO_trev_1_num
-      candidates: [CO_trev_1_num]
+    - axis: predictability        # forecast error (short-term prediction skill)
+      feature: FC_LocalSimple_mean3_stderr
+      candidates: [FC_LocalSimple_mean3_stderr]
+    - axis: successive_differences # proportion of large successive changes (pNN40)
+      feature: MD_hrv_classic_pnn40
+      candidates: [MD_hrv_classic_pnn40]
+    - axis: mutual_information    # non-linear temporal dependencies
+      feature: CO_HistogramAMI_even_2_5
+      candidates: [CO_HistogramAMI_even_2_5]
 
   # --- base signals the panel is applied to (~10) ------------------------
   # catch22 assumes a linear, z-normalizable series, so circular time-of-day
@@ -246,17 +236,16 @@ catch22:
   # central ones; awakenings/awake_pct stay basic-only. The high-coverage HR/
   # activity/steps streams (62-82%, nearly all-or-nothing) carry the rest.
   # `symptom_tail` (high|low) = which tail of this signal is pathological. It
-  # drives BOTH direction-sensitive panel axes (see panel above):
+  # drives the direction-sensitive panel axis (see panel above):
   #   outlier_extreme : high->p (HIGH-excursion timing), low->n (LOW-excursion timing)
-  #   persistence_run : high->mean_longstretch1 (sustained elevated state),
-  #                     low->diff_longstretch0 (sustained decline)
   # Mirrors each signal's basic profile direction (level_low/total_low vs level_high).
   base_features:
     - { signal: sleep.total_sleep_time, symptom_tail: low }    # short-sleep nights are the marker (cf. level_low)
     - { signal: sleep.sleep_efficiency, symptom_tail: low }    # fragmented / low-consolidation nights (cf. level_low)
-    - { signal: heartrate.FEATURE_017,  symptom_tail: high }   # elevated daily mean HR marker
+    - { signal: heartrate.FEATURE_031,  symptom_tail: low }    # reduced HRV (RMSSD) marker
     - { signal: heartrate.FEATURE_006,  symptom_tail: high }   # elevated night / resting HR marker
+    - { signal: heartrate.FEATURE_013,  symptom_tail: low }    # reduced HR complexity range (loss-of-complexity marker)
     - { signal: activity.FEATURE_001,   symptom_tail: high }   # very sedentary days (cf. total)
     - { signal: activity.FEATURE_016,   symptom_tail: low }    # inactive / few active-hours days (cf. level_low)
     - { signal: steps.FEATURE_001,      symptom_tail: low }    # low-step days (cf. total_low)
-    - { signal: steps.FEATURE_039,      symptom_tail: low }    # few bouts / inactivity (fragmentation)
+    - { signal: steps.FEATURE_007,      symptom_tail: low }    # reduced step variability / monotonous rhythm

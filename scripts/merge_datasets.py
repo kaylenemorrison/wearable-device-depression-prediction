@@ -542,6 +542,14 @@ def parse_yaml(
     activity_pipeline = build_pipeline("ACTIVITY", activity_config, with_desc=True)
     steps_pipeline = build_pipeline("STEPS", steps_config, with_desc=True)
 
+    print("--- CATCH22 FEATURE PIPELINE MAP ---")
+    panel = catch22_config.get('panel', [])
+    for base in catch22_config.get('base_features', []):
+        signal = base['signal']
+        symptom_tail = base['symptom_tail']
+        feature_names = _resolve_panel(panel, symptom_tail)
+        print(f"Feature: {signal:<18} (symptom_tail={symptom_tail})  -> Ops: {feature_names}")
+
     return sleep_pipeline, heartrate_pipeline, activity_pipeline, steps_pipeline, catch22_config
 
 
@@ -658,16 +666,17 @@ def main() -> None:
 
     final_dataset = final_dataset.drop(columns=["timeInterval_ID"])
 
-    # Drop aggregate columns with no observed values at all: they carry no
-    # information and trip per-fold imputers downstream.
+    # Check for aggregate columns with no observed values at all.
     all_nan_cols = final_dataset.columns[final_dataset.isna().all()].tolist()
     if all_nan_cols:
-        final_dataset = final_dataset.drop(columns=all_nan_cols)
-        log(f"  dropped {len(all_nan_cols)} all-NaN columns: {all_nan_cols}")
+        raise SystemExit(
+            f"Found {len(all_nan_cols)} all-NaN aggregate columns: {all_nan_cols}\n"
+            f"These columns carry no information and should not exist. Check the data pipeline."
+        )
 
-    log(f"  after column drop -> {final_dataset.shape}")
+    log(f"  all columns have at least one observed value -> {final_dataset.shape}")
 
-    # Resolve family -> columns now (post column-drop) so both the row filter
+    # Resolve family -> columns now (post validation) so both the row filter
     # below and the manifest use the same, final column lists.
     present = set(final_dataset.columns)
 
@@ -701,7 +710,7 @@ def main() -> None:
     # Emit a sidecar mapping each feature family to the columns it contributed,
     # so modeling.py can select any subset of {demographics, simple, catch22, adherence}
     # without re-deriving the naming convention. This is the producer's ground
-    # truth: it reflects the all-NaN column drop and catch22 window-gating (an
+    # truth: it reflects all-NaN column validation and catch22 window-gating (an
     # empty list at window sizes where the panel is not produced).
     manifest = {
         "window_size": window_size,

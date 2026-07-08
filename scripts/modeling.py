@@ -10,6 +10,7 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
+import shap
 import pandas as pd
 from lightgbm import LGBMClassifier, LGBMRegressor
 from missforest import MissForest
@@ -329,7 +330,7 @@ def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_sco
     print(f"  Optimism:    {np.mean(optimism):.4f} ± {np.std(optimism):.4f}  (train - test R²)")
     print("="*50 + "\n")
 
-def plot_calibration(y_true, y_pred, run_tag, title="Calibration: Actual vs Predicted"):
+def plot_calibration(y_true, y_pred, run_tag, model, title="Calibration: Actual vs Predicted"):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
@@ -379,11 +380,47 @@ def plot_calibration(y_true, y_pred, run_tag, title="Calibration: Actual vs Pred
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
 
     plt.tight_layout()
-    out_path = f"../results/calibration_{run_tag}.png"
+    out_dir = f"../results/{model}/calibration"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = f"{out_dir}/calibration_{run_tag}.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Calibration plot saved to {out_path}")
     return {"alpha": alpha, "beta": beta, "cil": cil, "r2": r2, "rmse": rmse, "mae": mae}
+
+def plot_shap_beeswarm(shap_values_folds, X_test_folds, run_tag, model,
+                       title="SHAP summary (out-of-fold test predictions)"):
+    """Beeswarm SHAP summary over the pooled outer test folds (XGBoost only).
+
+    Each (shap_values, X_test) pair comes from one outer fold: the SHAP values
+    were computed by a TreeExplainer over the fold model on its held-out rows,
+    so every sample is explained out-of-sample. The five test folds partition
+    the dataset, so stacking them row-wise reconstructs one SHAP value per
+    (row, feature) for the full dataset. The blocks share the same feature
+    columns, so np.vstack / pd.concat glue them vertically and stay row-aligned
+    (both preserve fold order), which is what summary_plot needs to color each
+    dot by its feature value.
+    """
+    shap_matrix = np.vstack(shap_values_folds)
+    X_matrix = pd.concat(X_test_folds, ignore_index=True)
+
+    plt.figure()
+    shap.summary_plot(shap_matrix, X_matrix, plot_type="dot", show=False)
+    plt.title(title)
+    plt.tight_layout()
+    out_dir = f"../results/{model}/shap"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = f"{out_dir}/shap_beeswarm_{run_tag}.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"SHAP beeswarm plot saved to {out_path}")
+
+    # Global importance ranking = mean |SHAP| per feature, matching how
+    # plot_calibration returns its summary numbers.
+    mean_abs = np.abs(shap_matrix).mean(axis=0)
+    ranking = (pd.Series(mean_abs, index=X_matrix.columns)
+               .sort_values(ascending=False))
+    return ranking
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -568,6 +605,10 @@ def main(args):
     fold_params = []
     y_true_all = []
     y_pred_all = []
+    # Out-of-fold SHAP: one (shap_values, X_test) block per outer fold, pooled
+    # after the loop into a single beeswarm (XGBoost only).
+    shap_values_all = []
+    X_test_all = []
 
     n_outer = outer_cv.get_n_splits()
     log(f"X={X.shape}, y={len(y)} | starting {n_outer}-fold outer CV")
@@ -663,6 +704,14 @@ def main(args):
             y_pred = best_model.predict(X_test)
             X_train_used = X_train
 
+            # Out-of-sample SHAP on this fold's held-out rows. The default
+            # tree_path_dependent perturbation reads the tree structure (via
+            # XGBoost's native pred_contribs), so it needs no background data
+            # and handles enable_categorical=True.
+            explainer = shap.TreeExplainer(best_model)
+            shap_values_all.append(explainer.shap_values(X_test))
+            X_test_all.append(X_test)
+
 
         fold_params.append(best_params)
 
@@ -698,7 +747,17 @@ def main(args):
     imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
     run_tag = (f"{args.model}_{imputation_label}_{args.feature_set_tag}"
                f"_w{args.window_size}_{args.fraction_tag}_{args.timestamp}")
-    plot_calibration(y_true_all, y_pred_all, run_tag)
+    plot_calibration(y_true_all, y_pred_all, run_tag, args.model)
+
+    if args.model == "xgboost":
+        shap_ranking = plot_shap_beeswarm(shap_values_all, X_test_all, run_tag, args.model)
+        print("\n" + "="*50)
+        print("SHAP FEATURE IMPORTANCE (mean |SHAP| over out-of-fold test rows)")
+        print("="*50)
+        print(f"\n  {'Feature':<45} Mean |SHAP|")
+        print("  " + "-" * 60)
+        for feature, value in shap_ranking.items():
+            print(f"  {feature:<45} {value:>10.6f}")
 
     print("\n" + "="*50)
     print("FINAL MODEL (tuned and fit on full dataset)")
@@ -769,7 +828,9 @@ if __name__ == "__main__":
     args = parse_args()
     args.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
-    out_path = (f"../results/{args.model}_{imputation_label}_{args.feature_set_tag}"
+    text_dir = f"../results/{args.model}/text"
+    os.makedirs(text_dir, exist_ok=True)
+    out_path = (f"{text_dir}/{args.model}_{imputation_label}_{args.feature_set_tag}"
                 f"_w{args.window_size}_{args.fraction_tag}_{args.timestamp}.txt")
     sys.stdout = open(out_path, "w", buffering=1)
     main(args)
