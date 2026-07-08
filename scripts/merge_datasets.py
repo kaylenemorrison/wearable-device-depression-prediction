@@ -514,6 +514,7 @@ def parse_args() -> argparse.Namespace:
 
 def parse_yaml(
     path_to_yaml: str,
+    window_size: int,
 ) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict]:
     with open(path_to_yaml, 'r') as file:
         # Use safe_load to prevent executing arbitrary code inside the YAML
@@ -542,13 +543,15 @@ def parse_yaml(
     activity_pipeline = build_pipeline("ACTIVITY", activity_config, with_desc=True)
     steps_pipeline = build_pipeline("STEPS", steps_config, with_desc=True)
 
-    print("--- CATCH22 FEATURE PIPELINE MAP ---")
-    panel = catch22_config.get('panel', [])
-    for base in catch22_config.get('base_features', []):
-        signal = base['signal']
-        symptom_tail = base['symptom_tail']
-        feature_names = _resolve_panel(panel, symptom_tail)
-        print(f"Feature: {signal:<18} (symptom_tail={symptom_tail})  -> Ops: {feature_names}")
+    # Only produced (and printed) when this window enables catch22.
+    if window_size in catch22_config.get('enabled_window_sizes', []):
+        print("--- CATCH22 FEATURE PIPELINE MAP ---")
+        panel = catch22_config.get('panel', [])
+        for base in catch22_config.get('base_features', []):
+            signal = base['signal']
+            symptom_tail = base['symptom_tail']
+            feature_names = _resolve_panel(panel, symptom_tail)
+            print(f"Feature: {signal:<18} (symptom_tail={symptom_tail})  -> Ops: {feature_names}")
 
     return sleep_pipeline, heartrate_pipeline, activity_pipeline, steps_pipeline, catch22_config
 
@@ -565,7 +568,7 @@ def main() -> None:
 
     log("Parsing feature spec...")
     (sleep_pipeline, heartrate_pipeline, activity_pipeline,
-     steps_pipeline, catch22_config) = parse_yaml(PATH_TO_YAML)
+     steps_pipeline, catch22_config) = parse_yaml(PATH_TO_YAML, window_size)
 
     # A single present-fraction floor drives both the simple aggregations and the
     # catch22 panel. Its allowed minimum depends on whether catch22 is produced

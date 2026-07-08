@@ -11,7 +11,7 @@ metric of the most recent matching run (latest timestamp wins); combinations
 with no run yet are left grey. Re-run this after new modeling runs to refresh.
 
     cd scripts
-    python summary_grid.py                       # Test RMSE, all fractions
+    python summary_grid.py                       # Test RMSE, most-populated fraction
     python summary_grid.py --metric r2
     python summary_grid.py --min-present-fraction 0.8
 """
@@ -84,12 +84,14 @@ def parse_metric(path, summary_label):
 
 
 def collect(panel_subdir, model_token, imp_token, summary_label, mp_filter):
-    """Latest-wins metric per (feature_set_tag, window) for one panel.
+    """Latest-wins metric per (feature_set_tag, window, mp) for one panel.
 
-    Returns {(fs_tag, window): value}. Scans only files whose model/imputation
-    match the panel; when mp_filter is set, restricts to that present-fraction.
+    Returns {(fs_tag, window, mp): value}. mp is part of the key, so runs at
+    different present-fractions never overwrite each other -- latest-wins is
+    scoped WITHIN a single mp. Scans only files whose model/imputation match the
+    panel; when mp_filter is set, restricts to that present-fraction.
     """
-    best = {}   # (fs, window) -> (timestamp, value)
+    best = {}   # (fs, window, mp) -> (timestamp, value)
     text_dir = os.path.join(RESULTS_DIR, panel_subdir, "text")
     for path in glob.glob(os.path.join(text_dir, "*.txt")):
         m = FILENAME_RE.match(os.path.basename(path))
@@ -99,13 +101,15 @@ def collect(panel_subdir, model_token, imp_token, summary_label, mp_filter):
             continue
         if imp_token is not None and m["imp"] != imp_token:
             continue
-        if mp_filter is not None and float(m["mp"]) != mp_filter:
+        mp = float(m["mp"])
+        if mp_filter is not None and mp != mp_filter:
             continue
 
-        key = (m["fs"], int(m["window"]))
-        if key[0] not in {fs for fs, _ in FEATURE_SETS} or key[1] not in WINDOWS:
+        fs, window = m["fs"], int(m["window"])
+        if fs not in {f for f, _ in FEATURE_SETS} or window not in WINDOWS:
             continue
 
+        key = (fs, window, mp)
         prev = best.get(key)
         if prev is not None and m["ts"] <= prev[0]:
             continue   # keep the newer run
@@ -162,18 +166,44 @@ def main():
     ap.add_argument("--metric", choices=list(METRICS), default="rmse",
                     help="Summary metric to grid. Default: rmse.")
     ap.add_argument("--min-present-fraction", type=float, default=None,
-                    help="Restrict to runs at this mp; default: any (latest wins).")
+                    help="Restrict the grid to runs at this mp; "
+                         "default: auto-pick the most-populated fraction.")
     ap.add_argument("--outfile", default=None,
                     help="Output PNG path. Default: ../results/summary_grid_<metric>.png")
     args = ap.parse_args()
 
     summary_label, lower_is_better = METRICS[args.metric]
 
-    matrices = []
+    # Collect (fs, window, mp)-keyed cells per panel; mp is preserved so runs at
+    # different fractions can't clobber each other.
+    panel_cells = []
     for title, subdir, model_token, imp_token in PANELS:
         cells = collect(subdir, model_token, imp_token, summary_label,
                         args.min_present_fraction)
-        matrices.append((title, build_matrix(cells)))
+        panel_cells.append((title, cells))
+
+    # The grid renders a single present-fraction so every cell shares the same
+    # floor. If --min-present-fraction was given, collect already restricted to
+    # it; otherwise auto-pick the fraction with the most populated cells across
+    # both panels (tie -> higher fraction).
+    if args.min_present_fraction is not None:
+        target_mp = args.min_present_fraction
+    else:
+        counts = {}
+        for _, cells in panel_cells:
+            for (_, _, mp) in cells:
+                counts[mp] = counts.get(mp, 0) + 1
+        target_mp = max(counts, key=lambda mp: (counts[mp], mp)) if counts else None
+        if len(counts) > 1:
+            print(f"Multiple present-fractions found {sorted(counts)}; "
+                  f"showing mp={target_mp:g} (most populated). "
+                  f"Pass --min-present-fraction to pick another.")
+
+    # Reduce each panel to (fs, window) at the chosen fraction for rendering.
+    matrices = []
+    for title, cells in panel_cells:
+        grid = {(fs, w): v for (fs, w, mp), v in cells.items() if mp == target_mp}
+        matrices.append((title, build_matrix(grid)))
 
     # Shared color scale across both panels so cells are comparable model-to-model.
     finite = np.concatenate([m.compressed() for _, m in matrices]) \
@@ -200,8 +230,7 @@ def main():
                         ax=axes, fraction=0.025, pad=0.02)
     cbar.set_label(f"{summary_label}  ({better})")
 
-    mp_note = (f"  |  mp={args.min_present_fraction:g}"
-               if args.min_present_fraction is not None else "  |  latest run per cell")
+    mp_note = f"  |  mp={target_mp:g}" if target_mp is not None else ""
     fig.suptitle(f"Held-out {summary_label} by feature set × window{mp_note}",
                  fontsize=14)
 
