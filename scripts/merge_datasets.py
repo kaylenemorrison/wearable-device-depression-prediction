@@ -431,7 +431,13 @@ def create_catch22_aggs(
 
     `min_present_fraction` overrides the YAML floor when provided (validated by
     the caller to be no looser than the config floor)."""
-    keys = phq8[GROUP_COLS].drop_duplicates().reset_index(drop=True)
+    keys = phq8[GROUP_COLS].reset_index(drop=True)
+    dupes = keys[keys.duplicated()]
+    if not dupes.empty:
+        raise ValueError(
+            f"phq8 has duplicate {GROUP_COLS} rows, expected one row per window:\n"
+            f"{dupes.drop_duplicates()}"
+        )
 
     if not enabled:
         return keys.copy()
