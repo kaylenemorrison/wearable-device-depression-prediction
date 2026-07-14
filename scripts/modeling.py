@@ -352,23 +352,31 @@ def plot_calibration(y_true, y_pred, run_tag, model, title="Calibration: Actual 
     pad = (hi - lo) * 0.05
     lims = np.array([lo - pad, hi + pad])
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(y_pred, y_true, alpha=0.5, edgecolor="k", linewidth=0.3)
+    # Sampled from the "viridis" colormap (same scheme as the SHAP beeswarm)
+    # so the two plot types read as one visual system.
+    cmap = plt.get_cmap("viridis")
+    scatter_color = cmap(0.9)
+    diagonal_color = "gray"
+    fit_color = cmap(0.2)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(y_pred, y_true, alpha=0.5, color=scatter_color, edgecolor="k", linewidth=0.3)
 
     # Perfect-calibration diagonal (actual = predicted)
-    ax.plot(lims, lims, "--", color="gray", label="Perfect calibration")
+    ax.plot(lims, lims, "--", color=diagonal_color, linewidth=3, label="Perfect calibration")
 
     # Fitted calibration line: actual = alpha + beta * predicted
-    ax.plot(lims, beta * lims + alpha, color="red",
+    ax.plot(lims, beta * lims + alpha, color=fit_color, linewidth=3,
             label=f"Calibration fit (α={alpha:.3f}, β={beta:.2f})")
 
     ax.set_xlim(lims)
     ax.set_ylim(lims)
     ax.set_aspect("equal")
-    ax.set_xlabel("Predicted PHQ-8 Score")
-    ax.set_ylabel("Actual PHQ-8 Score")
-    ax.set_title(title)
-    ax.legend(loc="upper left")
+    ax.set_xlabel("Predicted PHQ-8 Score", fontsize=16)
+    ax.set_ylabel("Actual PHQ-8 Score", fontsize=16)
+    ax.set_title(title, fontsize=18)
+    ax.tick_params(labelsize=16)
+    ax.legend(loc="upper left", fontsize=16)
 
     # Metrics box
     txt = (f"α (intercept) = {alpha:.3f}\n"
@@ -376,17 +384,49 @@ def plot_calibration(y_true, y_pred, run_tag, model, title="Calibration: Actual 
            f"CIL           = {cil:.3f}\n"
            f"R² = {r2:.3f}   RMSE = {rmse:.3f}   MAE = {mae:.3f}")
     ax.text(0.97, 0.03, txt, transform=ax.transAxes,
-            ha="right", va="bottom", family="monospace",
+            ha="right", va="bottom", family="monospace", fontsize=16,
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
 
     plt.tight_layout()
     out_dir = f"../results/{model}/calibration"
     os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/calibration_{run_tag}.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path_png = f"{out_dir}/calibration_{run_tag}.png"
+    out_path_svg = f"{out_dir}/calibration_{run_tag}.svg"
+    plt.savefig(out_path_png, dpi=300, bbox_inches="tight")
+    plt.savefig(out_path_svg, format="svg", bbox_inches="tight")
     plt.close(fig)
-    print(f"Calibration plot saved to {out_path}")
+    print(f"Calibration plot saved to {out_path_png}")
+    print(f"Calibration plot saved to {out_path_svg}")
     return {"alpha": alpha, "beta": beta, "cil": cil, "r2": r2, "rmse": rmse, "mae": mae}
+
+def build_feature_description_map():
+    """Build a mapping from feature column names to human-readable descriptions.
+
+    Descriptions come from feature_spec.yaml (wearable features) and hardcoded
+    demographics. Used to relabel SHAP plot axes for readability."""
+    name_to_desc = {
+        "age": "age",
+        "gender": "gender",
+        "audit_1": "Alcohol consumption frequency",
+        "mh_smoking": "Smoking status",
+        "depression_medication": "Currently taking depression medication",
+    }
+
+    with open(PATH_TO_YAML) as fh:
+        spec = yaml.safe_load(fh)
+
+    for stream in ["sleep", "heartrate", "activity", "steps"]:
+        stream_config = spec.get(stream, {})
+        for feature_name, feature_cfg in stream_config.items():
+            desc = feature_cfg.get("desc")
+            if desc:
+                profile = feature_cfg.get("profile")
+                ops = spec.get("profiles", {}).get(profile, [])
+                for op in ops:
+                    col_name = f"{stream}_{feature_name}_{op}"
+                    name_to_desc[col_name] = f"{desc} ({op})"
+
+    return name_to_desc
 
 def plot_shap_beeswarm(shap_values_folds, X_test_folds, run_tag, model,
                        title="SHAP summary (out-of-fold test predictions)"):
@@ -404,16 +444,37 @@ def plot_shap_beeswarm(shap_values_folds, X_test_folds, run_tag, model,
     shap_matrix = np.vstack(shap_values_folds)
     X_matrix = pd.concat(X_test_folds, ignore_index=True)
 
-    plt.figure()
-    shap.summary_plot(shap_matrix, X_matrix, plot_type="dot", show=False)
-    plt.title(title)
+    name_to_desc = build_feature_description_map()
+    X_renamed = X_matrix.rename(columns=name_to_desc)
+
+    plt.figure(figsize=(10, 7.5))
+    shap.summary_plot(shap_matrix, X_renamed, plot_type="dot", max_display=10,
+                       cmap="viridis", show=False)
+    fig = plt.gcf()
+    ax = plt.gca()
+    ax.set_title(title)
+    # shap.summary_plot draws its "Feature value" colorbar on a separate axis
+    for cax in fig.axes:
+        if cax is not ax and cax.get_ylabel() == "Feature value":
+            cax.set_ylabel("Feature value")
     plt.tight_layout()
+    # Keep the beeswarm dots rasterized (a fully-vector scatter is tens of
+    # thousands of path nodes, which PowerPoint's SVG engine refuses to render
+    # and shows as a red X). Text/axes stay vector in the SVG regardless, so
+    # labels print crisp on A0; only the embedded dot bitmap is resolution-bound,
+    # so save the SVG at high DPI to keep the dots sharp at poster scale.
+    for cax in fig.axes:
+        for artist in cax.collections:
+            artist.set_rasterized(True)
     out_dir = f"../results/{model}/shap"
     os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/shap_beeswarm_{run_tag}.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path_png = f"{out_dir}/shap_beeswarm_{run_tag}.png"
+    out_path_svg = f"{out_dir}/shap_beeswarm_{run_tag}.svg"
+    plt.savefig(out_path_png, dpi=300, bbox_inches="tight")
+    plt.savefig(out_path_svg, format="svg", bbox_inches="tight", dpi=600)
     plt.close()
-    print(f"SHAP beeswarm plot saved to {out_path}")
+    print(f"SHAP beeswarm plot saved to {out_path_png}")
+    print(f"SHAP beeswarm plot saved to {out_path_svg}")
 
     # Global importance ranking = mean |SHAP| per feature, matching how
     # plot_calibration returns its summary numbers.

@@ -57,18 +57,18 @@ profiles:
 # SLEEP  (subtotal: 28)  — priority stream
 # ===========================================================================
 sleep:
-  total_sleep_time: { profile: level_low }                   # 3
-  sleep_efficiency: { profile: level_low }                   # 3
-  deep_pct:         { profile: level }                       # 2
-  REM_pct:          { profile: level }                       # 2
-  awake_pct:        { profile: level_high }                  # 3
-  sleep_onset:      { profile: timeofday }                   # 2  (circular; basic-only)
-  sleep_offset:     { profile: timeofday }                   # 2  (circular; basic-only)
-  sleep_midpoint:   { profile: timeofday }                   # 2  (derived; circadian phase)
-  rem_latency:      { profile: level_low }                   # 3  (low tail = shortened REM latency, a depression marker)
-  awakenings:       { profile: level_high }                  # 3
-  insomnia:         { profile: binary_count }                # 2
-  hypersomnia:      { profile: binary_count_min }            # 1
+  total_sleep_time: { profile: level_low,  desc: "Total sleep time" }                       # 3
+  sleep_efficiency: { profile: level_low,  desc: "Sleep efficiency" }                        # 3
+  deep_pct:         { profile: level,      desc: "Deep sleep percentage" }                   # 2
+  REM_pct:          { profile: level,      desc: "REM sleep percentage" }                    # 2
+  awake_pct:        { profile: level_high, desc: "Awake percentage" }                        # 3
+  sleep_onset:      { profile: timeofday,  desc: "Sleep onset time" }                        # 2  (circular; basic-only)
+  sleep_offset:     { profile: timeofday,  desc: "Sleep offset time" }                       # 2  (circular; basic-only)
+  sleep_midpoint:   { profile: timeofday,  desc: "Sleep midpoint" }                          # 2  (derived; circadian phase)
+  rem_latency:      { profile: level_low,  desc: "REM latency" }                             # 3  (low tail = shortened REM latency, a depression marker)
+  awakenings:       { profile: level_high, desc: "Number of awakenings" }                    # 3
+  insomnia:         { profile: binary_count,     desc: "Insomnia days" }                     # 2
+  hypersomnia:      { profile: binary_count_min, desc: "Hypersomnia days" }                  # 1
   # NREM_pct dropped (collinear: stage percentages sum to ~1).
 
 # ===========================================================================

@@ -1,10 +1,7 @@
-"""Build a two-panel summary grid from modeling.py result files.
+"""Build an XGBoost summary grid from modeling.py result files.
 
-Scans the per-model text outputs under ../results/{model}/text/, parses the
-held-out Summary metric from each run, and renders two heatmaps:
-
-  * XGBoost
-  * ElasticNet + MissForest
+Scans the per-model text outputs under ../results/xgboost/text/, parses the
+held-out Summary metric from each run, and renders a heatmap for XGBoost.
 
 x-axis = window size (3, 7, 14, 28); y-axis = feature set. Each cell is the
 metric of the most recent matching run (latest timestamp wins); combinations
@@ -43,7 +40,6 @@ FEATURE_SETS = [
 # (panel title, text subdir, model token, required imputation token or None)
 PANELS = [
     ("XGBoost", "xgboost", "xgboost", None),
-    ("ElasticNet + MissForest", "elastic_net", "elastic_net", "missforest"),
 ]
 
 # metric -> (label in the Summary block, lower_is_better)
@@ -133,13 +129,14 @@ def build_matrix(cell_values):
 
 def draw_panel(ax, matrix, title, cmap, norm, lower_is_better):
     ax.imshow(matrix, cmap=cmap, norm=norm, aspect="auto")
-    ax.set_title(title, fontsize=12, pad=10)
+    ax.set_title(title, fontsize=18, pad=10)
 
     ax.set_xticks(range(len(WINDOWS)))
-    ax.set_xticklabels([f"w{w}" for w in WINDOWS])
+    ax.set_xticklabels([f"w{w}" for w in WINDOWS], fontsize=16)
     ax.set_yticks(range(len(FEATURE_SETS)))
-    ax.set_yticklabels([label for _, label in FEATURE_SETS])
-    ax.set_xlabel("window size")
+    ax.set_yticklabels([label.replace("+", "+\n") for _, label in FEATURE_SETS],
+                       fontsize=16)
+    ax.set_xlabel("window size", fontsize=16)
 
     # 2px surface gap between cells (dataviz mark-spacer convention).
     ax.set_xticks(np.arange(-0.5, len(WINDOWS), 1), minor=True)
@@ -157,7 +154,7 @@ def draw_panel(ax, matrix, title, cmap, norm, lower_is_better):
             lum = 0.299 * r + 0.587 * g + 0.114 * b
             ax.text(j, i, f"{v:.2f}", ha="center", va="center",
                     color="white" if lum < 0.5 else "#111111",
-                    fontsize=10, fontweight="bold")
+                    fontsize=16, fontweight="bold")
 
 
 def main():
@@ -169,8 +166,10 @@ def main():
                     help="Restrict the grid to runs at this mp; "
                          "default: auto-pick the most-populated fraction.")
     ap.add_argument("--outfile", default=None,
-                    help="Output PNG path. Default: ../results/summary_grid_<metric>.png")
+                    help="Output SVG path. Default: ../results/summary_grid_<metric>.svg")
     args = ap.parse_args()
+
+    plt.rcParams["font.family"] = "Verdana"
 
     summary_label, lower_is_better = METRICS[args.metric]
 
@@ -217,32 +216,33 @@ def main():
         vmin, vmax = vmin - 0.5, vmax + 0.5
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
-    # Sequential single hue; orient so the *better* end is the darker (salient) one.
-    cmap = plt.get_cmap("Blues_r" if lower_is_better else "Blues").copy()
+    # Use viridis: low values = purple, high values = yellow
+    cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad("#e0e0e0")               # missing cells -> grey
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5), constrained_layout=True)
-    for ax, (title, matrix) in zip(axes, matrices):
-        draw_panel(ax, matrix, title, cmap, norm, lower_is_better)
+    fig, ax = plt.subplots(1, 1, figsize=(9.5, 6.5), constrained_layout=True)
+    title, matrix = matrices[0]
+    draw_panel(ax, matrix, title, cmap, norm, lower_is_better)
 
     better = "lower is better" if lower_is_better else "higher is better"
     cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-                        ax=axes, fraction=0.025, pad=0.02)
-    cbar.set_label(f"{summary_label}  ({better})")
+                        ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label(f"{summary_label}  ({better})", fontsize=16)
+    cbar.ax.tick_params(labelsize=16)
 
     mp_note = f"  |  mp={target_mp:g}" if target_mp is not None else ""
-    fig.suptitle(f"Held-out {summary_label} by feature set × window{mp_note}",
-                 fontsize=14)
+    # fig.suptitle(f"Held-out {summary_label} by feature set × window{mp_note}",
+    #              fontsize=20)
 
-    outfile = args.outfile or f"{RESULTS_DIR}/summary_grid_{args.metric}.png"
-    fig.savefig(outfile, dpi=150, bbox_inches="tight")
+    outfile_svg = args.outfile or f"{RESULTS_DIR}/summary_grid_{args.metric}.svg"
+    fig.savefig(outfile_svg, format="svg", bbox_inches="tight")
     plt.close(fig)
 
     # Console recap: how many cells populated per panel.
     print(f"Metric: {summary_label} ({better})")
     for title, matrix in matrices:
         print(f"  {title:<28} {matrix.count():>2}/{matrix.size} cells populated")
-    print(f"Wrote {outfile}")
+    print(f"Wrote {outfile_svg}")
 
 
 if __name__ == "__main__":
