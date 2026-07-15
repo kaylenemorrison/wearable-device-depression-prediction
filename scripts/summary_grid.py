@@ -1,15 +1,18 @@
 """Build an XGBoost summary grid from modeling.py result files.
 
-Scans the per-model text outputs under ../results/xgboost/text/, parses the
-held-out Summary metric from each run, and renders a heatmap for XGBoost.
+Scans the per-model text outputs under ../results/<model>/text/, parses the
+held-out Summary metric from each run, and renders a heatmap per model
+(elastic_net and/or xgboost, selected with --model).
 
 x-axis = window size (3, 7, 14, 28); y-axis = feature set. Each cell is the
 metric of the most recent matching run (latest timestamp wins); combinations
 with no run yet are left grey. Re-run this after new modeling runs to refresh.
 
     cd scripts
-    python summary_grid.py                       # Test RMSE, most-populated fraction
+    python summary_grid.py                       # Test RMSE, both models, most-populated fraction
     python summary_grid.py --metric r2
+    python summary_grid.py --model xgboost        # single-model panel
+    python summary_grid.py --format svg           # png (default) or svg
     python summary_grid.py --min-present-fraction 0.8
 """
 import argparse
@@ -37,10 +40,11 @@ FEATURE_SETS = [
     ("catch22", "catch22"),
 ]
 
-# (panel title, text subdir, model token, required imputation token or None)
-PANELS = [
-    ("XGBoost", "xgboost", "xgboost", None),
-]
+# model key -> (panel title, text subdir, model token, required imputation token or None)
+PANELS = {
+    "elastic_net": ("Elastic Net", "elastic_net", "elastic_net", "missforest"),
+    "xgboost": ("XGBoost", "xgboost", "xgboost", None),
+}
 
 # metric -> (label in the Summary block, lower_is_better)
 METRICS = {
@@ -70,7 +74,7 @@ def parse_metric(path, summary_label):
     first number (the mean). '±' is unicode, so read the file as utf-8.
     """
     label = re.escape(summary_label)
-    pat = re.compile(rf"^\s*{label}:\s*([0-9.]+)")
+    pat = re.compile(rf"^\s*{label}:\s*(-?[0-9.]+)")
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             m = pat.match(line)
@@ -127,15 +131,18 @@ def build_matrix(cell_values):
     return np.ma.masked_invalid(data)
 
 
-def draw_panel(ax, matrix, title, cmap, norm, lower_is_better):
+def draw_panel(ax, matrix, title, cmap, norm, lower_is_better, show_yticks=True):
     ax.imshow(matrix, cmap=cmap, norm=norm, aspect="auto")
     ax.set_title(title, fontsize=18, pad=10)
 
     ax.set_xticks(range(len(WINDOWS)))
     ax.set_xticklabels([f"w{w}" for w in WINDOWS], fontsize=16)
     ax.set_yticks(range(len(FEATURE_SETS)))
-    ax.set_yticklabels([label.replace("+", "+\n") for _, label in FEATURE_SETS],
-                       fontsize=16)
+    if show_yticks:
+        ax.set_yticklabels([label.replace("+", "+\n") for _, label in FEATURE_SETS],
+                           fontsize=16)
+    else:
+        ax.set_yticklabels([])
     ax.set_xlabel("window size", fontsize=16)
 
     # 2px surface gap between cells (dataviz mark-spacer convention).
@@ -162,11 +169,17 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--metric", choices=list(METRICS), default="rmse",
                     help="Summary metric to grid. Default: rmse.")
+    ap.add_argument("--model", choices=["elastic_net", "xgboost", "both"],
+                    default="both",
+                    help="Which model panel(s) to render. Default: both.")
     ap.add_argument("--min-present-fraction", type=float, default=None,
                     help="Restrict the grid to runs at this mp; "
                          "default: auto-pick the most-populated fraction.")
+    ap.add_argument("--format", choices=["png", "svg"], default="png",
+                    help="Output image format. Default: png.")
     ap.add_argument("--outfile", default=None,
-                    help="Output SVG path. Default: ../results/summary_grid_<metric>.svg")
+                    help="Output path. If omitted, the extension follows --format. "
+                         "Default: ../results/summary_grid_<metric>.<format>")
     args = ap.parse_args()
 
     plt.rcParams["font.family"] = "Verdana"
@@ -175,8 +188,10 @@ def main():
 
     # Collect (fs, window, mp)-keyed cells per panel; mp is preserved so runs at
     # different fractions can't clobber each other.
+    selected = ["elastic_net", "xgboost"] if args.model == "both" else [args.model]
     panel_cells = []
-    for title, subdir, model_token, imp_token in PANELS:
+    for key in selected:
+        title, subdir, model_token, imp_token = PANELS[key]
         cells = collect(subdir, model_token, imp_token, summary_label,
                         args.min_present_fraction)
         panel_cells.append((title, cells))
@@ -220,13 +235,17 @@ def main():
     cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad("#e0e0e0")               # missing cells -> grey
 
-    fig, ax = plt.subplots(1, 1, figsize=(9.5, 6.5), constrained_layout=True)
-    title, matrix = matrices[0]
-    draw_panel(ax, matrix, title, cmap, norm, lower_is_better)
+    n = len(matrices)
+    fig, axes = plt.subplots(1, n, figsize=(9.5 * n, 6.5),
+                             constrained_layout=True, squeeze=False)
+    axes = axes[0]
+    for k, (ax, (title, matrix)) in enumerate(zip(axes, matrices)):
+        draw_panel(ax, matrix, title, cmap, norm, lower_is_better,
+                   show_yticks=(k == 0))
 
     better = "lower is better" if lower_is_better else "higher is better"
     cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-                        ax=ax, fraction=0.025, pad=0.02)
+                        ax=list(axes), fraction=0.025, pad=0.02)
     cbar.set_label(f"{summary_label}  ({better})", fontsize=16)
     cbar.ax.tick_params(labelsize=16)
 
@@ -234,15 +253,21 @@ def main():
     # fig.suptitle(f"Held-out {summary_label} by feature set × window{mp_note}",
     #              fontsize=20)
 
-    outfile_svg = args.outfile or f"{RESULTS_DIR}/summary_grid_{args.metric}.svg"
-    fig.savefig(outfile_svg, format="svg", bbox_inches="tight")
+    model_tag = "" if args.model == "both" else f"_{args.model}"
+    if args.outfile:
+        outfile = args.outfile
+        fmt = os.path.splitext(outfile)[1].lstrip(".").lower() or args.format
+    else:
+        fmt = args.format
+        outfile = f"{RESULTS_DIR}/summary_grid_{args.metric}{model_tag}.{fmt}"
+    fig.savefig(outfile, format=fmt, bbox_inches="tight")
     plt.close(fig)
 
     # Console recap: how many cells populated per panel.
     print(f"Metric: {summary_label} ({better})")
     for title, matrix in matrices:
         print(f"  {title:<28} {matrix.count():>2}/{matrix.size} cells populated")
-    print(f"Wrote {outfile_svg}")
+    print(f"Wrote {outfile}")
 
 
 if __name__ == "__main__":
