@@ -53,9 +53,9 @@ def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
     """Split df into (X, y, groups) and encode the categorical/boolean columns.
 
     encode_as_codes=True (elastic net + MissForest): cat.codes -> integer codes
-    carried as 'category' dtype. MissForest requires int/float/bool input
-    (`missforest_impute` casts these codes to Int64), and the OHE consumes them
-    fine. encode_as_codes=False (XGBoost, enable_categorical=True): keep the
+    left as float64 (NaN for missing). MissForest accepts float input directly,
+    and the OHE consumes the numeric codes fine. encode_as_codes=False (XGBoost,
+    enable_categorical=True): keep the
     original labels as 'category' dtype so they are treated as unordered nominal
     — no cat.codes. XGBoost fits on X_train only, so a level appearing only in
     test-fold participants is unseen at train time and routed to the
@@ -70,7 +70,6 @@ def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
         if encode_as_codes:
             X[col] = X[col].cat.codes
             X[col] = X[col].replace(-1, np.nan)
-            X[col] = X[col].astype('category')
         elif X[col].dtype.name != 'category':
             X[col] = X[col].astype('category')
     return X, y, groups
@@ -78,14 +77,12 @@ def prepare_data(df, categorical_cols, boolean_cols, encode_as_codes=True):
 def missforest_impute(X_train, X_test, categorical_features, max_iter=3):
     """Leakage-free MissForest imputation: fit on train only, apply to test.
 
-    missforest 4.x accepts only int/float/bool columns, so the integer-coded
-    categorical columns (cat.codes / 0-1 flags, carried as 'category' dtype)
-    are cast to nullable Int64 on the way in. The imputer's output is returned
-    as-is (categoricals come back as Int64): the elastic-net pipeline's
-    OneHotEncoder and boolean passthrough consume those integer codes directly,
-    so no dtype restore is needed (and casting back to 'category' here would
-    actually break the OneHotEncoder). A LGBMClassifier is used for the
-    categorical columns and a LGBMRegressor for the numeric ones.
+    The categorical columns arrive as float64 integer codes (cat.codes with NaN
+    for missing; see prepare_data), which missforest 4.x accepts directly -- no
+    dtype coercion needed. The imputer's output is returned as-is: the elastic-net
+    pipeline's OneHotEncoder and boolean passthrough consume the numeric codes
+    directly. A LGBMClassifier is used for the categorical columns and a
+    LGBMRegressor for the numeric ones.
     Returns X_train_imp, or (X_train_imp, X_test_imp) when X_test is given."""
     imputer = MissForest(
         clf=LGBMClassifier(linear_tree=True, verbosity=-1, random_state=SEED),
@@ -95,16 +92,10 @@ def missforest_impute(X_train, X_test, categorical_features, max_iter=3):
         verbose=0,
     )
 
-    def _to_input(X):
-        X = X.copy()
-        for col in categorical_features:
-            X[col] = X[col].astype("Int64")
-        return X
-
-    X_train_imp = imputer.fit_transform(_to_input(X_train))
+    X_train_imp = imputer.fit_transform(X_train)
     if X_test is None:
         return X_train_imp
-    X_test_imp = imputer.transform(_to_input(X_test))
+    X_test_imp = imputer.transform(X_test)
     return X_train_imp, X_test_imp
 
 def impute_inner_folds(X_train, y_train, groups_train, inner_cv,
@@ -653,8 +644,11 @@ def main(args):
     else:
         X, y, groups = prepare_data(df, categorical_cols, all_boolean_cols)
 
-    categorical_features = X.select_dtypes(include="category").columns.tolist()
-    numerical_cols = X.select_dtypes(exclude="category").columns.tolist()
+    # Column families come straight from the explicit demographic lists above:
+    # the codes path leaves categoricals as float64 (no 'category' dtype to
+    # detect), and these lists are already exactly the categorical/boolean set.
+    categorical_features = categorical_cols + all_boolean_cols
+    numerical_cols = [c for c in X.columns if c not in categorical_features]
 
     outer_cv = GroupKFold(n_splits=5)
     inner_cv = GroupKFold(n_splits=3)
