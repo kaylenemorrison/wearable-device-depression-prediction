@@ -1,10 +1,47 @@
 import pandas as pd
+import yaml
 
-## DON'T CHOOSE SLEEP ROWS RANDOMLY!! CHANGE SCRIPT TO CHOOSE THE LONGEST SLEEP EPISODE PER DAY PER PERSON
 
 PATH_TO_TIME_INTERVALS = "../data/radarV1_MDD/csv_files/timeIntervals.csv"
 PATH_TO_SLEEP = "../data/radarV1_MDD/csv_files/dailyFeatures_fitbit_sleep.csv"
 PATH_TO_CLEAN_DATA = '../data_cleaned/sleep_data.csv'
+PATH_TO_YAML = "../feature_spec.yaml"
+
+# Non-feature key columns always kept in the cleaned output.
+ID_COLUMNS = ["participant_name", "timeInterval_ID"]
+
+# Sleep features referenced in feature_spec.yaml that are NOT present in the raw
+# sleep data because they are DERIVED later in merge_datasets.py (_derive_sleep,
+# e.g. sleep_midpoint from sleep_onset/offset). They are excluded from selection
+# here; listing them explicitly means any OTHER missing YAML column still surfaces
+# as an error rather than being silently dropped.
+DERIVED_SLEEP_COLUMNS = {"sleep_midpoint"}
+
+
+def load_sleep_feature_columns():
+    """
+    Read the sleep columns to keep in the cleaned dataset from feature_spec.yaml.
+
+    feature_spec.yaml is the single source of truth. Two sections consume raw
+    sleep columns downstream, so both are unioned here:
+      - the `sleep:` section (basic aggregation features), and
+      - any `sleep.*` base signal in the catch22 `base_features` panel.
+
+    Returns the column names de-duplicated, `sleep:` section order first.
+    """
+    with open(PATH_TO_YAML, "r") as file:
+        # safe_load to avoid executing arbitrary code inside the YAML.
+        feature_spec = yaml.safe_load(file)
+
+    columns = list(feature_spec.get("sleep", {}).keys())
+
+    catch22_config = feature_spec.get("catch22", {})
+    for entry in catch22_config.get("base_features", []):
+        stream, _, column = entry.get("signal", "").partition(".")
+        if stream == "sleep" and column and column not in columns:
+            columns.append(column)
+
+    return columns
 
 def load_in_time_intervals():
     """
@@ -21,6 +58,49 @@ def load_in_time_intervals():
     time_intervals["date"] = pd.to_datetime(time_intervals["datetimeStart"]).dt.normalize()
     time_intervals.drop(columns = {"datetimeStart", "datetimeEnd"}, inplace = True)
     return time_intervals
+
+# Only sleep columns that are consumed downstream (i.e. have an entry in the
+# `sleep:` section of feature_spec.yaml) are winsorized here — winsorizing a
+# column that never becomes a feature adds nothing. Circular time-of-day columns
+# (sleep_onset/offset/midpoint) and binary day-flags (insomnia/hypersomnia) are
+# intentionally excluded: quantile clipping is meaningless for those types.
+#
+# IMPORTANT: if feature_spec.yaml is changed to feed a NEW sleep column into the
+# feature set, you must revisit WINSORIZE_LIMITS below and add it (or make a
+# deliberate choice to leave it uncapped). This mapping does not track
+# feature_spec.yaml automatically.
+#
+# Winsorization limits per column: (lower_quantile, upper_quantile).
+# A None bound leaves that tail uncapped (asymmetrical winsorization).
+WINSORIZE_LIMITS = {
+    "total_sleep_time": (0.01, 0.99),
+    "sleep_efficiency": (0.01, 0.99),
+    "deep_pct": (0.01, 0.99),
+    "REM_pct": (0.01, 0.99),
+    "awake_pct": (0.01, 0.99),
+    "rem_latency": (None, 0.95),
+    "awakenings": (None, 0.99),
+}
+
+
+def winsorize(sleep_data):
+    """
+    Clip outliers in selected sleep columns to their quantile bounds.
+
+    For each column in WINSORIZE_LIMITS, values are clipped to the given
+    lower/upper quantiles. A None bound leaves that tail uncapped, giving
+    asymmetrical (upper-tail-only) winsorization. Quantiles are computed on
+    non-null values and NaNs are preserved.
+
+    Returns:
+        pd.DataFrame: sleep_data with the listed columns winsorized in place.
+    """
+    for column, (lower_q, upper_q) in WINSORIZE_LIMITS.items():
+        lower = sleep_data[column].quantile(lower_q) if lower_q is not None else None
+        upper = sleep_data[column].quantile(upper_q) if upper_q is not None else None
+        sleep_data[column] = sleep_data[column].clip(lower=lower, upper=upper)
+    return sleep_data
+
 
 def assertions(sleep_data):
     """
@@ -43,10 +123,11 @@ def main():
     1. Load and preprocess time interval data.
     2. Load raw sleep data and align column names.
     3. Merge sleep data with time intervals to attach a normalized date.
-    4. Select relevant features for analysis.
+    4. Select the sleep feature columns declared in feature_spec.yaml.
     5. Remove duplicates by choosing the row with the longest period of sleep per (participant_name, timeInterval_ID).
-    6. Run data quality assertions to ensure integrity and consistency.
-    7. Save the cleaned dataset to disk.
+    6. Winsorize selected columns to their quantile bounds to cap outliers.
+    7. Run data quality assertions to ensure integrity and consistency.
+    8. Save the cleaned dataset to disk.
 
     Output:
         Writes cleaned sleep data to './data_cleaned/sleep_data.csv'.
@@ -59,11 +140,16 @@ def main():
     sleep_data.rename(columns={"time_interval": "timeInterval_ID"}, inplace = True)
     sleep_data = sleep_data.merge(time_intervals, on="timeInterval_ID", how="left")
 
-    relevant_columns = ["participant_name", "timeInterval_ID", "total_sleep_time", 
-                         "time_in_bed", 'light_pct', 'deep_pct', 'REM_pct',
-                         'awake_pct', 'NREM_pct', 'sleep_onset', 'sleep_offset', 'rem_latency',
-                         'sleep_efficiency', 'awakenings', 'insomnia', 'hypersomnia']
-    
+    sleep_features = [
+        col for col in load_sleep_feature_columns()
+        if col not in DERIVED_SLEEP_COLUMNS
+    ]
+    missing = [col for col in sleep_features if col not in sleep_data.columns]
+    assert not missing, (
+        f"feature_spec.yaml sleep columns absent from raw sleep data: {missing}"
+    )
+
+    relevant_columns = ID_COLUMNS + sleep_features
     sleep_data = sleep_data[relevant_columns]
 
     sleep_data = (
@@ -71,6 +157,8 @@ def main():
         .apply(lambda x: x.loc[x['total_sleep_time'].idxmax()])
         .reset_index(drop=True)
     )
+
+    sleep_data = winsorize(sleep_data)
 
     assertions(sleep_data)
 

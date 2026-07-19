@@ -82,7 +82,7 @@ heartrate:
   FEATURE_021: { profile: level, desc: "Mean HR sedentary, night only (resting proxy)" }
   FEATURE_030: { profile: level, desc: "Mean SDNN across all day (HRV, v2)" }
   FEATURE_031: { profile: level, desc: "Mean RMSSD across all day (HRV, v2)" }
-  FEATURE_011: { profile: level, desc: "Lempel-Ziv complexity, hourly mean HR" }
+  FEATURE_012: { profile: level, desc: "Mean hourly Lempel-Ziv complexity of HR" }
   # FEATURE_032/033 (sedentary HRV v2) dropped: collinear with 030/031.
 
 # ===========================================================================
@@ -244,7 +244,7 @@ catch22:
     - { signal: sleep.sleep_efficiency, symptom_tail: low }    # fragmented / low-consolidation nights (cf. level_low)
     - { signal: heartrate.FEATURE_031,  symptom_tail: low }    # reduced HRV (RMSSD) marker
     - { signal: heartrate.FEATURE_006,  symptom_tail: high }   # elevated night / resting HR marker
-    - { signal: heartrate.FEATURE_013,  symptom_tail: low }    # reduced HR complexity range (loss-of-complexity marker)
+    - { signal: heartrate.FEATURE_012,  symptom_tail: low }    # reduced mean HR complexity (loss-of-complexity marker)
     - { signal: activity.FEATURE_001,   symptom_tail: high }   # very sedentary days (cf. total)
     - { signal: activity.FEATURE_016,   symptom_tail: low }    # inactive / few active-hours days (cf. level_low)
     - { signal: steps.FEATURE_001,      symptom_tail: low }    # low-step days (cf. total_low)
