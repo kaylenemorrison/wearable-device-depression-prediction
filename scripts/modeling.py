@@ -481,11 +481,11 @@ def parse_args():
     parser.add_argument(
         "--feature-set",
         nargs="+",
-        choices=["demographics", "simple", "catch22", "adherence"],
+        choices=["demographics", "simple", "slope", "catch22", "adherence"],
         default=["simple"],
         help=(
             "One or more feature families to pool (any non-empty subset of "
-            "demographics, simple, catch22, adherence). Default: simple."
+            "demographics, simple, slope, catch22, adherence). Default: simple."
         ),
     )
     parser.add_argument(
@@ -522,7 +522,7 @@ def parse_args():
 
     # Normalize the selected families to a fixed order and drop duplicates, so
     # the run tag / output filename are deterministic regardless of CLI order.
-    family_order = ["demographics", "simple", "catch22", "adherence"]
+    family_order = ["demographics", "simple", "slope", "catch22", "adherence"]
     args.feature_set = [f for f in family_order if f in args.feature_set]
     args.feature_set_tag = "+".join(args.feature_set)
 

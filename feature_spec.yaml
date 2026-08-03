@@ -4,8 +4,11 @@
 # aggregation set, instead of applying the blanket [min,max,mean,median,std]
 # grid to every column. Target budget: ~120 features total.
 #
-# Two feature families, pooled into one vector:
+# Three feature families, pooled into one vector:
 #   - basic aggregations  : level / spread / extreme / total over the window.
+#   - linear slope        : signed within-window trend (OLS slope vs day index) for
+#                           every non-circular / non-binary signal; complementary to
+#                           basic (which is order-invariant) and to catch22. See `slope:`.
 #   - catch22 (panel)     : a fixed, axis-diverse panel of z-normalized dynamical
 #                           features spread across many base signals; complementary
 #                           to basic (catch22 discards level & scale). See `catch22:`.
@@ -18,10 +21,11 @@
 meta:
   demographic_raw: 4                           # raw predictor columns: age, gender, mh_smoking, audit_1 (phq8_score is outcome)
   demographic_feature_count: 8                 # after one-hot: age(1) + gender(1, binary) + mh_smoking(2, 3 levels-1) + audit_1(4, 5 levels-1)
-  basic_feature_count: 76                      # see per-stream subtotals below
+  basic_feature_count: 74                      # see per-stream subtotals below
+  slope_feature_count: 25                      # 1 OLS slope per non-circular/non-binary signal; see `slope:`
   catch22_feature_count: 45                    # fixed panel (5) x base set (9); see `catch22:`
   adherence_feature_count: 8                   # missing_last + missing_consecutive_max per stream (4 streams)
-  total_feature_count: 137                     # demographics(8) + basic(76) + catch22(45) + adherence(8)
+  total_feature_count: 160                     # demographics(8) + basic(74) + slope(25) + catch22(45) + adherence(8)
 
   # Output naming convention (matches merge_datasets.py): "<stream>_<col>_<stat>".
   # mean is intentionally DROPPED where median is present (collinear); median is
@@ -54,13 +58,12 @@ profiles:
   binary_count_min: [sum]                      # day-flags where only the count matters
 
 # ===========================================================================
-# SLEEP  (subtotal: 28)  — priority stream
+# SLEEP  (subtotal: 26)  — priority stream
 # ===========================================================================
 sleep:
   total_sleep_time: { profile: level_low,  desc: "Total sleep time" }                       # 3
   sleep_efficiency: { profile: level_low,  desc: "Sleep efficiency" }                        # 3
-  deep_pct:         { profile: level,      desc: "Deep sleep percentage" }                   # 2
-  REM_pct:          { profile: level,      desc: "REM sleep percentage" }                    # 2
+  rem_deep_ratio:   { profile: level,      desc: "Ratio of REM to deep sleep percentage" }   # 2  (derived; REM_pct / deep_pct)
   awake_pct:        { profile: level_high, desc: "Awake percentage" }                        # 3
   sleep_onset:      { profile: timeofday,  desc: "Sleep onset time" }                        # 2  (circular; basic-only)
   sleep_offset:     { profile: timeofday,  desc: "Sleep offset time" }                       # 2  (circular; basic-only)
@@ -69,6 +72,7 @@ sleep:
   awakenings:       { profile: level_high, desc: "Number of awakenings" }                    # 3
   insomnia:         { profile: binary_count,     desc: "Insomnia days" }                     # 2
   hypersomnia:      { profile: binary_count_min, desc: "Hypersomnia days" }                  # 1
+  # deep_pct / REM_pct dropped as standalone features; folded into rem_deep_ratio.
   # NREM_pct dropped (collinear: stage percentages sum to ~1).
 
 # ===========================================================================
@@ -123,6 +127,67 @@ adherence:
   - steps_missing_consecutive_max
   - heartrate_missing_last{N}
   - heartrate_missing_consecutive_max
+
+# ===========================================================================
+# LINEAR SLOPE  (subtotal: 25)  — within-window trend
+#   (SINGLE source of truth for all slope columns)
+#
+# One scalar per base signal: the OLS slope of the daily values regressed on the
+# day index across the window (value ~ day_index). Captures the DIRECTION and rate
+# of change over the window — a rising vs falling trajectory — which the order-
+# invariant basic aggregations (level / spread / extreme / total) cannot see, and
+# which is complementary to the z-normalized catch22 panel (catch22 discards level
+# and scale; slope keeps the signed rate in the signal's own units per day).
+#
+# Applied to every base signal that is NEITHER circular NOR binary: circular
+# time-of-day columns (sleep_onset/offset/midpoint, most-active-hour) have no
+# meaningful linear slope, and the day-flag counts (insomnia/hypersomnia) are not
+# continuous series. This section is the SINGLE source of truth for which columns
+# get a slope; the per-stream entries above carry no slope flag (mirrors the
+# catch22 section, to keep the two from drifting).
+#
+# Gating: slope is order-aware but robust at short lengths (fittable from a handful
+# of points), so it is produced at ALL window sizes — unlike catch22. It reuses the
+# basic-aggregation --min-present-fraction floor (a signal whose present fraction in
+# the window is below the floor is nulled). The regression uses each window's
+# PRESENT days at their true day indices (no interpolation), so it is NOT subject to
+# the catch22 consecutive-missing gate and injects no fabricated points. Per-window
+# and train/test-symmetric -> no CV leakage.
+#
+# Output naming (matches merge_datasets.py): "<stream>_<col>_slope".
+# Budget: 25 signals x 1 = 25 (sleep 6, heartrate 8, activity 6, steps 5).
+# ===========================================================================
+slope:
+  base_features:
+    # --- sleep (6) — circular onset/offset/midpoint + binary insomnia/hypersomnia excluded ---
+    - sleep.total_sleep_time
+    - sleep.sleep_efficiency
+    - sleep.rem_deep_ratio
+    - sleep.awake_pct
+    - sleep.rem_latency
+    - sleep.awakenings
+    # --- heartrate (8) — all level signals ---
+    - heartrate.FEATURE_017
+    - heartrate.FEATURE_006
+    - heartrate.FEATURE_018
+    - heartrate.FEATURE_005
+    - heartrate.FEATURE_021
+    - heartrate.FEATURE_030
+    - heartrate.FEATURE_031
+    - heartrate.FEATURE_012
+    # --- activity (6) — circular FEATURE_018 (most active hour) excluded ---
+    - activity.FEATURE_001
+    - activity.FEATURE_004
+    - activity.FEATURE_005
+    - activity.FEATURE_013
+    - activity.FEATURE_015
+    - activity.FEATURE_016
+    # --- steps (5) — circular FEATURE_022 (most active hour) excluded ---
+    - steps.FEATURE_001
+    - steps.FEATURE_019
+    - steps.FEATURE_039
+    - steps.FEATURE_040
+    - steps.FEATURE_021
 
 # ===========================================================================
 # catch22 configuration  (SINGLE source of truth for all catch22 columns)

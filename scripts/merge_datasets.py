@@ -262,9 +262,14 @@ def aggregate_stream(
 
 
 def _derive_sleep(window: pd.DataFrame) -> pd.DataFrame:
-    """Add the derived circadian-phase column the sleep pipeline references."""
+    """Add the derived sleep columns the sleep pipeline references but the raw
+    table does not contain: circadian phase (sleep_midpoint) and REM:deep ratio."""
     duration = calculate_sleep_duration(window['sleep_onset'], window['sleep_offset'])
     window['sleep_midpoint'] = (window['sleep_onset'] + duration / 2) % 24
+    # Ratio of REM to deep sleep percentage. deep_pct == 0 nights would divide by
+    # zero, so guard them to NaN (counted as a missing day like any other gap).
+    deep = window['deep_pct'].replace(0, np.nan)
+    window['rem_deep_ratio'] = window['REM_pct'] / deep
     return window
 
 
@@ -329,6 +334,86 @@ def create_adherence_steps(phq8: pd.DataFrame, steps: pd.DataFrame, window_size:
 
 def create_adherence_heartrate(phq8: pd.DataFrame, heartrate: pd.DataFrame, window_size: int) -> pd.DataFrame:
     return _compute_adherence_indicators(phq8, heartrate, 'heartrate', window_size)
+
+
+# ---------------------------------------------------------------------------
+# Linear slope (within-window trend)
+# ---------------------------------------------------------------------------
+def _slope_value(
+    series: np.ndarray,
+    min_present_fraction: float,
+    window_size: int,
+) -> float:
+    """OLS slope (per day) of one base signal over a single window.
+
+    `series` is the window's daily values in chronological order (length
+    window_size, oldest first, NaN for missing days). The slope is fit on the
+    PRESENT days at their true within-window positions -- gaps are left as gaps
+    (no interpolation), so spacing is honored and no points are fabricated.
+    Returns NaN when the present fraction is below the floor (the same floor as
+    the simple aggregations) or fewer than 2 real days remain to fit a line.
+    Unlike the catch22 panel there is no consecutive-missing gate: without
+    interpolation a gap injects no fabricated dynamics."""
+    series = np.asarray(series, dtype=float)
+    present = np.isfinite(series)
+    n_present = int(present.sum())
+    if n_present / window_size < min_present_fraction or n_present < 2:
+        return np.nan
+    x = np.arange(window_size, dtype=float)[present]  # true positions, gaps preserved
+    y = series[present]
+    return float(np.polyfit(x, y, 1)[0])
+
+
+def create_slope_aggs(
+    phq8: pd.DataFrame,
+    sleep: pd.DataFrame,
+    activity: pd.DataFrame,
+    steps: pd.DataFrame,
+    heartrate: pd.DataFrame,
+    slope_cfg: dict,
+    window_size: int,
+    min_present_fraction: float,
+) -> pd.DataFrame:
+    """Linear within-window slope for each base signal in the YAML `slope`
+    section. One scalar per signal ("<stream>_<col>_slope"), fit oldest->newest
+    so a positive slope is a rise toward the assessment.
+
+    Produced at ALL window sizes (slope is robust at short lengths), so -- unlike
+    the catch22 panel -- there is no `enabled` gate. Reuses the shared
+    present-fraction floor for nulling."""
+    keys = phq8[GROUP_COLS].reset_index(drop=True)
+    base_features = slope_cfg.get('base_features', [])
+    streams = {'sleep': sleep, 'activity': activity, 'steps': steps, 'heartrate': heartrate}
+
+    window = create_window(phq8, window_size)
+    result = keys.copy()
+
+    for base in base_features:
+        stream_name, col = base.split('.')
+        daily = (
+            streams[stream_name][['participant_name', 'timeInterval_ID', col]]
+            .rename(columns={'timeInterval_ID': 'timeInterval_ID_window'})
+        )
+        merged = window.merge(
+            daily,
+            on=['participant_name', 'timeInterval_ID_window'],
+            how='left',
+        )
+        # Chronological order within each window: largest lag (oldest day) first.
+        merged = merged.sort_values(
+            GROUP_COLS + ['lag'], ascending=[True, True, False]
+        )
+
+        records = []
+        for keys_tuple, group in merged.groupby(GROUP_COLS, sort=False):
+            val = _slope_value(group[col].to_numpy(), min_present_fraction, window_size)
+            records.append((*keys_tuple, val))
+
+        out_col = f'{stream_name}_{col}_slope'
+        block = pd.DataFrame.from_records(records, columns=GROUP_COLS + [out_col])
+        result = result.merge(block, on=GROUP_COLS, how='left')
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +606,7 @@ def parse_args() -> argparse.Namespace:
 def parse_yaml(
     path_to_yaml: str,
     window_size: int,
-) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict]:
+) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict, dict]:
     with open(path_to_yaml, 'r') as file:
         # Use safe_load to prevent executing arbitrary code inside the YAML
         feature_spec = yaml.safe_load(file)
@@ -530,6 +615,7 @@ def parse_yaml(
     heartrate_config = feature_spec.get('heartrate', {})
     activity_config = feature_spec.get('activity', {})
     steps_config = feature_spec.get('steps', {})
+    slope_config = feature_spec.get('slope', {})
     catch22_config = feature_spec.get('catch22', {})
 
     def build_pipeline(label: str, config: dict, with_desc: bool = False) -> dict[str, list[str]]:
@@ -549,6 +635,10 @@ def parse_yaml(
     activity_pipeline = build_pipeline("ACTIVITY", activity_config, with_desc=True)
     steps_pipeline = build_pipeline("STEPS", steps_config, with_desc=True)
 
+    print("--- SLOPE FEATURE PIPELINE MAP ---")
+    for base in slope_config.get('base_features', []):
+        print(f"Feature: {base:<28}  -> Ops: ['slope']")
+
     # Only produced (and printed) when this window enables catch22.
     if window_size in catch22_config.get('enabled_window_sizes', []):
         print("--- CATCH22 FEATURE PIPELINE MAP ---")
@@ -559,7 +649,7 @@ def parse_yaml(
             feature_names = _resolve_panel(panel, symptom_tail)
             print(f"Feature: {signal:<18} (symptom_tail={symptom_tail})  -> Ops: {feature_names}")
 
-    return sleep_pipeline, heartrate_pipeline, activity_pipeline, steps_pipeline, catch22_config
+    return sleep_pipeline, heartrate_pipeline, activity_pipeline, steps_pipeline, slope_config, catch22_config
 
 
 def main() -> None:
@@ -574,7 +664,7 @@ def main() -> None:
 
     log("Parsing feature spec...")
     (sleep_pipeline, heartrate_pipeline, activity_pipeline,
-     steps_pipeline, catch22_config) = parse_yaml(PATH_TO_YAML, window_size)
+     steps_pipeline, slope_config, catch22_config) = parse_yaml(PATH_TO_YAML, window_size)
 
     # A single present-fraction floor drives both the simple aggregations and the
     # catch22 panel. Its allowed minimum depends on whether catch22 is produced
@@ -631,6 +721,16 @@ def main() -> None:
     simple_heartrate_agg = create_simple_aggs_heartrate(phq8, heartrate, heartrate_pipeline, window_size, min_present_fraction)
     log(f"  heartrate done -> {simple_heartrate_agg.shape}")
 
+    log("Computing linear slopes...")
+    # rem_deep_ratio is a DERIVED daily sleep column (REM_pct / deep_pct), not in
+    # the raw table -- the simple-agg path adds it post-merge via _derive_sleep.
+    # Derive it (and sleep_midpoint) up front on the raw daily table so the slope
+    # loop can look up any configured sleep signal like any other column; the
+    # per-day derivation is identical to deriving post-merge.
+    slope_agg = create_slope_aggs(phq8, _derive_sleep(sleep.copy()), activity, steps,
+                                  heartrate, slope_config, window_size, min_present_fraction)
+    log(f"  slope done -> {slope_agg.shape}")
+
     log("Aggregating catch22...")
     catch22_agg = create_catch22_aggs(phq8, sleep, activity, steps, heartrate, catch22_config,
                                       window_size, catch22_enabled, min_present_fraction=min_present_fraction)
@@ -648,6 +748,7 @@ def main() -> None:
         simple_activity_agg,
         simple_steps_agg,
         simple_heartrate_agg,
+        slope_agg,
         catch22_agg,
         adherence_sleep,
         adherence_activity,
@@ -697,27 +798,31 @@ def main() -> None:
 
     simple_cols = family_cols([simple_sleep_agg, simple_activity_agg,
                                 simple_steps_agg, simple_heartrate_agg])
+    slope_cols = family_cols([slope_agg])
     catch22_cols = family_cols([catch22_agg])
 
     # Drop windows (PHQ-8 assessment rows) with zero wearable signal: every
-    # simple aggregate AND every catch22 feature is NaN. These rows carry no
-    # simple/catch22 information regardless of imputation strategy, so keeping
-    # them only pads the row count with pure noise for those two families.
-    # (catch22_cols is empty when the panel isn't produced for this window, so
-    # the check correctly reduces to "all simple features NaN" there.)
-    check_cols = simple_cols + catch22_cols
+    # simple aggregate, slope, AND catch22 feature is NaN. These rows carry no
+    # simple/slope/catch22 information regardless of imputation strategy, so
+    # keeping them only pads the row count with pure noise for those families.
+    # slope is a no-op here (a slope is non-NaN only when its signal cleared the
+    # present-fraction floor, which also makes that signal's simple aggregates
+    # non-NaN), but is included so every wearable-derived family is treated
+    # uniformly. catch22_cols is empty when the panel isn't produced for this
+    # window, so the check correctly reduces there.
+    check_cols = simple_cols + slope_cols + catch22_cols
     if check_cols:
         fully_missing = final_dataset[check_cols].isna().all(axis=1)
         n_dropped = int(fully_missing.sum())
         if n_dropped:
             final_dataset = final_dataset.loc[~fully_missing].reset_index(drop=True)
-            log(f"  dropped {n_dropped} rows with all simple+catch22 features NaN")
+            log(f"  dropped {n_dropped} rows with all simple+slope+catch22 features NaN")
 
     log(f"  final dataset -> {final_dataset.shape}")
 
     # --- column manifest ----------------------------------------------------
     # Emit a sidecar mapping each feature family to the columns it contributed,
-    # so modeling.py can select any subset of {demographics, simple, catch22, adherence}
+    # so modeling.py can select any subset of {demographics, simple, slope, catch22, adherence}
     # without re-deriving the naming convention. This is the producer's ground
     # truth: it reflects all-NaN column validation and catch22 window-gating (an
     # empty list at window sizes where the panel is not produced).
@@ -730,6 +835,7 @@ def main() -> None:
         "demographics": [c for c in demographics.columns
                          if c != "participant_name" and c in present],
         "simple": simple_cols,
+        "slope": slope_cols,
         "catch22": catch22_cols,
         "adherence": family_cols([adherence_sleep, adherence_activity,
                                    adherence_steps, adherence_heartrate]),
@@ -746,7 +852,8 @@ def main() -> None:
         json.dump(manifest, fh, indent=2)
     log(f"Wrote {manifest_path} "
         f"(demographics={len(manifest['demographics'])}, "
-        f"simple={len(manifest['simple'])}, catch22={len(manifest['catch22'])})")
+        f"simple={len(manifest['simple'])}, slope={len(manifest['slope'])}, "
+        f"catch22={len(manifest['catch22'])})")
 
 
 if __name__ == "__main__":

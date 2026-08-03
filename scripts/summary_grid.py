@@ -31,7 +31,8 @@ WINDOWS = [3, 7, 14, 28]
 
 # y-axis: (feature_set_tag as written by modeling.py, display label). The tag is
 # the fixed-order "+".join produced by parse_args (family_order = demographics,
-# simple, catch22, adherence), so these must match that ordering exactly.
+# simple, slope, catch22, adherence), so these must match that ordering exactly
+# (e.g. a slope combo is written "demographics+simple+slope+catch22+adherence").
 FEATURE_SETS = [
     ("demographics", "demographics"),
     ("demographics+simple", "demo+simple"),

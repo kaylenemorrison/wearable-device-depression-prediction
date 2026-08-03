@@ -982,22 +982,5 @@ demographics = demographics.drop(columns = ["redcap_event_name"])
 # drop_school_1 categories: ['No', 'Yes']
 # depression_medication categories: ['No', 'Yes']
 
-
-# final columns = [
-    # 'participant_name',          (subject ID)
-    #  'age',                      (numeric, float64)
-    #  'gender_at_birth',          (boolean, numeric)
-    #  'marital_status',           (categorical)
-    #  'children',                 (boolean, numeric)
-    #  'ethnicity_1',              (categorical)
-    #  'eduction_finish_age',      (numeric, float64)
-    #  'drop_school_1',            (boolean, numeric)
-    #  'accommodation',            (categorical)
-    #  'mh_smoking',               (ordinal, numeric)
-    #  'audit_1',                  (ordinal, numeric)
-    #  'depression_medication'     (boolean, numeric)
-    #]
-
-#demographics.to_csv(PATH_TO_CLEAN_DATA, index = False)
 demographics.to_parquet(PATH_TO_CLEAN_DATA, engine='pyarrow')
 

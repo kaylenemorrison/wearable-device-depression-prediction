@@ -11,11 +11,19 @@ PATH_TO_YAML = "../feature_spec.yaml"
 ID_COLUMNS = ["participant_name", "timeInterval_ID"]
 
 # Sleep features referenced in feature_spec.yaml that are NOT present in the raw
-# sleep data because they are DERIVED later in merge_datasets.py (_derive_sleep,
-# e.g. sleep_midpoint from sleep_onset/offset). They are excluded from selection
-# here; listing them explicitly means any OTHER missing YAML column still surfaces
-# as an error rather than being silently dropped.
-DERIVED_SLEEP_COLUMNS = {"sleep_midpoint"}
+# sleep data because they are DERIVED later in merge_datasets.py (_derive_sleep):
+#   - sleep_midpoint  from sleep_onset / sleep_offset
+#   - rem_deep_ratio  from REM_pct / deep_pct
+# They are excluded from selection here; listing them explicitly means any OTHER
+# missing YAML column still surfaces as an error rather than being silently dropped.
+DERIVED_SLEEP_COLUMNS = {"sleep_midpoint", "rem_deep_ratio"}
+
+# Raw sleep columns that are no longer features in their own right (dropped from
+# the `sleep:` section of feature_spec.yaml) but must still be retained in the
+# cleaned output because a DERIVED feature is computed from them downstream
+# (merge_datasets._derive_sleep): rem_deep_ratio = REM_pct / deep_pct. They are
+# kept and winsorized here but are not aggregated into the final feature set.
+DERIVATION_INPUT_COLUMNS = ["deep_pct", "REM_pct"]
 
 
 def load_sleep_feature_columns():
@@ -60,10 +68,13 @@ def load_in_time_intervals():
     return time_intervals
 
 # Only sleep columns that are consumed downstream (i.e. have an entry in the
-# `sleep:` section of feature_spec.yaml) are winsorized here — winsorizing a
-# column that never becomes a feature adds nothing. Circular time-of-day columns
-# (sleep_onset/offset/midpoint) and binary day-flags (insomnia/hypersomnia) are
-# intentionally excluded: quantile clipping is meaningless for those types.
+# `sleep:` section of feature_spec.yaml, or feed a derived feature) are winsorized
+# here — winsorizing a column that never becomes a feature adds nothing. Circular
+# time-of-day columns (sleep_onset/offset/midpoint) and binary day-flags
+# (insomnia/hypersomnia) are intentionally excluded: quantile clipping is
+# meaningless for those types. deep_pct/REM_pct are no longer features but are
+# winsorized as the raw inputs to the derived rem_deep_ratio (built in
+# merge_datasets._derive_sleep), so that ratio inherits bounded tails.
 #
 # IMPORTANT: if feature_spec.yaml is changed to feed a NEW sleep column into the
 # feature set, you must revisit WINSORIZE_LIMITS below and add it (or make a
@@ -144,6 +155,11 @@ def main():
         col for col in load_sleep_feature_columns()
         if col not in DERIVED_SLEEP_COLUMNS
     ]
+    # Retain the raw inputs that downstream derivations consume (not features
+    # themselves, so absent from the YAML sleep section).
+    sleep_features += [
+        col for col in DERIVATION_INPUT_COLUMNS if col not in sleep_features
+    ]
     missing = [col for col in sleep_features if col not in sleep_data.columns]
     assert not missing, (
         f"feature_spec.yaml sleep columns absent from raw sleep data: {missing}"
@@ -152,11 +168,15 @@ def main():
     relevant_columns = ID_COLUMNS + sleep_features
     sleep_data = sleep_data[relevant_columns]
 
-    sleep_data = (
-        sleep_data.groupby(['participant_name', 'timeInterval_ID'], group_keys=False)
-        .apply(lambda x: x.loc[x['total_sleep_time'].idxmax()])
-        .reset_index(drop=True)
+    # Keep, per (participant_name, timeInterval_ID), the row with the longest
+    # total_sleep_time. Select by index rather than returning rows from
+    # groupby.apply: pandas 3.x excludes the grouping columns from the applied
+    # frame, so the apply form silently drops the ID columns.
+    keep_idx = (
+        sleep_data.groupby(['participant_name', 'timeInterval_ID'])['total_sleep_time']
+        .idxmax()
     )
+    sleep_data = sleep_data.loc[keep_idx].reset_index(drop=True)
 
     sleep_data = winsorize(sleep_data)
 
