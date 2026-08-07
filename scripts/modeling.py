@@ -1,7 +1,9 @@
 import argparse
 import glob
+import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 import warnings
@@ -12,6 +14,7 @@ import numpy as np
 import optuna
 import shap
 import pandas as pd
+from joblib import Parallel, delayed, parallel_config
 from lightgbm import LGBMClassifier, LGBMRegressor
 from missforest import MissForest
 from optuna.samplers import TPESampler
@@ -26,10 +29,30 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import xgboost as xgb
 import yaml
 
+from classes.repeated_groupkfold import RepeatedGroupKFold
+
 # os.environ["TQDM_DISABLE"] = "True"
 
 SEED = 42
 PATH_TO_YAML = "../feature_spec.yaml"
+
+# Outer CV is RepeatedGroupKFold: OUTER_SPLITS folds per repetition, repeated
+# --n-repeats times with a different participant partition each time. Within a
+# repetition every window is held out exactly once, so the repetition's pooled
+# out-of-fold predictions give ONE performance estimate over the full dataset;
+# the spread across repetitions is what the repeats exist to measure. Tuning is
+# re-done inside every outer training set with INNER_SPLITS-fold grouped CV.
+OUTER_SPLITS = 10
+INNER_SPLITS = 5
+
+# Optuna budget per outer fold, overridable with --n-trials.
+DEFAULT_TRIALS = {"elastic_net": 40, "xgboost": 40}
+
+# Repetition whose out-of-fold pass backs the calibration scatter and the SHAP
+# beeswarm. One repetition is one complete partition of the dataset, which is
+# exactly what those plots depict; running them over all repetitions would
+# re-plot the same rows --n-repeats times for no added information.
+PLOT_REPEAT = 0
 
 def catch22_enabled_windows():
     """Window sizes for which the catch22 panel is produced, read from the
@@ -83,7 +106,12 @@ def missforest_impute(X_train, X_test, categorical_features, max_iter=3):
     pipeline's OneHotEncoder and boolean passthrough consume the numeric codes
     directly. A LGBMClassifier is used for the categorical columns and a
     LGBMRegressor for the numeric ones.
-    Returns X_train_imp, or (X_train_imp, X_test_imp) when X_test is given."""
+    Returns X_train_imp, or (X_train_imp, X_test_imp) when X_test is given.
+
+    The LightGBM learners are left at their default thread count on purpose:
+    called from an outer-CV worker they inherit OMP_NUM_THREADS=1 from joblib's
+    inner_max_num_threads, and called from the driver (the final full-data fit)
+    they get the whole machine. Pinning n_jobs=1 here would cost the latter."""
     imputer = MissForest(
         clf=LGBMClassifier(linear_tree=True, verbosity=-1, random_state=SEED),
         rgr=LGBMRegressor(linear_tree=True, verbosity=-1, random_state=SEED),
@@ -165,7 +193,12 @@ def create_elastic_net_pipeline(categorical_cols, boolean_cols, numerical_cols,
         ("elasticnet", ElasticNet(random_state=42, max_iter=20000)),
     ])
 
-def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40):
+def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40, n_jobs=1, show_progress=False):
+    # n_jobs=1 / show_progress=False are the defaults because these searches
+    # normally run *inside* a joblib worker that is already one of --n-jobs
+    # parallel outer folds: nesting a second parallel layer there oversubscribes
+    # the cores, and 1000 concurrent progress bars are unreadable. The full-data
+    # final search at the end of main() is the one caller that gets both.
     base_pipeline = create_elastic_net_pipeline(categorical_cols, all_boolean_cols, numerical_cols)
     def objective(trial):
         alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
@@ -183,7 +216,7 @@ def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categoric
             cv=gkf,                     # grouped cross validiation
             groups = groups,
             scoring="neg_mean_squared_error", # MSE
-            n_jobs=-1,                  # parallelize
+            n_jobs=n_jobs,
         )
         return (-1) * neg_mses.mean()
 
@@ -193,11 +226,12 @@ def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categoric
         sampler=TPESampler(seed=SEED),
         study_name="depression_elastic_net_tuning_simple_imputation",
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress)
     return study
 
 def run_optuna_search_missforest_imputation_elastic_net(cached_folds, categorical_cols,
-                      all_boolean_cols, numerical_cols, n_trials=40):
+                      all_boolean_cols, numerical_cols, n_trials=40,
+                      show_progress=False):
     base_pipeline = create_elastic_net_pipeline(
         categorical_cols, all_boolean_cols, numerical_cols, include_imputers=False
     )
@@ -224,10 +258,11 @@ def run_optuna_search_missforest_imputation_elastic_net(cached_folds, categorica
         sampler=TPESampler(seed=SEED),
         study_name="depression_elastic_net_tuning_missforest_imputation",
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress)
     return study
 
-def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=80):
+def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=40, n_jobs=1,
+                              show_progress=False):
     def objective(trial):
         params = {
             "n_estimators":     trial.suggest_int("n_estimators", 200, 1500, step=100),
@@ -256,7 +291,7 @@ def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=80):
             cv=gkf,
             groups=groups,
             scoring="neg_mean_squared_error",
-            n_jobs=-1,
+            n_jobs=n_jobs,
         )
         return (-1) * neg_mses.mean()
 
@@ -266,8 +301,257 @@ def run_optuna_search_xgboost(X, y, gkf, groups, n_trials=80):
         sampler=TPESampler(seed=SEED),
         study_name="depression_xgb_tuning",
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress)
     return study
+
+# --- parallel outer CV: identity, checkpointing, and the per-fold worker -----
+
+def run_key_for(args):
+    """Timestamp-free identity of a run's *configuration*.
+
+    `run_tag` (the .txt and plot filenames) ends in a per-invocation timestamp so
+    successive runs of one config sit side by side and summary_grid.py can take
+    the latest. Checkpoints need the opposite: a resume after a crash, or a
+    second invocation extending the repetition count, must land in the SAME
+    directory or nothing is ever reused. Hence the tag minus the timestamp --
+    still carrying model, imputation, feature set, window and mp/c22, so no two
+    configurations can ever share a directory.
+    """
+    imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
+    return (f"{args.model}_{imputation_label}_{args.feature_set_tag}"
+            f"_w{args.window_size}_{args.fraction_tag}")
+
+def code_fingerprint():
+    """Hash of the code that produces a fold result, for checkpoint validation.
+
+    Reusing checkpoints written by a different version of the modeling code
+    would silently blend incompatible results into one summary. Hashing the two
+    files that decide what a fold *is* catches that; a git SHA would not, since
+    the tree is usually dirty mid-experiment.
+    """
+    h = hashlib.sha256()
+    for path in (__file__, "classes/repeated_groupkfold.py"):
+        try:
+            with open(path, "rb") as fh:
+                h.update(fh.read())
+        except OSError:
+            h.update(b"<missing>")
+    return h.hexdigest()[:16]
+
+def run_identity(args):
+    """Fields that must match for a checkpoint directory to be reusable.
+
+    `n_repeats` is deliberately absent: RepeatedGroupKFold under an int seed
+    makes repetition r the same partition regardless of how many repetitions
+    were requested, so a run with more repeats is a strict superset of a
+    shorter one and can reuse every fold already on disk. The tuning budget and
+    fold counts *do* belong here -- they change what a fold result means.
+    """
+    return {
+        "code": code_fingerprint(),
+        "n_trials": args.n_trials,
+        "outer_splits": OUTER_SPLITS,
+        "inner_splits": INNER_SPLITS,
+        "seed": SEED,
+    }
+
+def prepare_run_dir(args, run_key, X, y, groups, log):
+    """Create/validate the checkpoint directory and stage the data for workers.
+
+    Returns (run_dir, data_dir). Workers read X/y/groups from `data_dir` once per
+    process rather than receiving them pickled with each of the ~1000 tasks.
+    """
+    run_dir = f"../results/{args.model}/repeats/{run_key}"
+    data_dir = f"{run_dir}/_data"
+    manifest_path = f"{run_dir}/manifest.json"
+    identity = run_identity(args)
+
+    if args.fresh and os.path.isdir(run_dir):
+        log(f"--fresh: discarding existing checkpoints in {run_dir}")
+        shutil.rmtree(run_dir)
+
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as fh:
+            previous = json.load(fh)
+        stale = {k: (previous.get(k), v) for k, v in identity.items()
+                 if previous.get(k) != v}
+        if stale:
+            detail = ", ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in stale.items())
+            sys.exit(
+                f"Checkpoints in {run_dir} were written under a different "
+                f"configuration ({detail}).\nRe-run with --fresh to discard them, "
+                f"or restore the previous settings to resume."
+            )
+
+    os.makedirs(data_dir, exist_ok=True)
+    with open(manifest_path, "w") as fh:
+        json.dump(identity, fh, indent=2)
+
+    # Staged to parquet rather than passed through joblib: loky pickles task
+    # arguments per task, so shipping the frame 1000 times would cost more than
+    # the fitting. Workers cache it per process (see _worker_data).
+    X.to_parquet(f"{data_dir}/X.parquet")
+    pd.DataFrame({"y": y, "groups": groups}).to_parquet(f"{data_dir}/meta.parquet")
+    return run_dir, data_dir
+
+_WORKER_DATA = {}
+
+def _worker_data(data_dir):
+    """Load the staged X/y/groups once per worker process, then reuse.
+
+    loky reuses its worker processes across tasks, so this module-level cache is
+    populated once per worker (n_jobs loads) instead of once per fold.
+    """
+    cached = _WORKER_DATA.get(data_dir)
+    if cached is None:
+        X = pd.read_parquet(f"{data_dir}/X.parquet")
+        meta = pd.read_parquet(f"{data_dir}/meta.parquet")
+        cached = (X, meta["y"], meta["groups"])
+        _WORKER_DATA[data_dir] = cached
+    return cached
+
+def fold_paths(run_dir, repeat, fold):
+    """(predictions path, record path) for one outer fold.
+
+    One file per fold, never a shared append target: with --n-jobs workers
+    finishing concurrently, appending to a single log risks interleaved partial
+    writes. The .json is written last and is the completion marker.
+    """
+    stem = f"{run_dir}/rep{repeat:03d}_fold{fold:02d}"
+    return f"{stem}.npz", f"{stem}.json"
+
+def run_outer_fold(repeat, fold, train_idx, test_idx, data_dir, run_dir,
+                   categorical_cols, boolean_cols, numerical_cols,
+                   model, imputation, n_trials, collect_shap):
+    """Tune, fit, and score ONE outer fold, then checkpoint it.
+
+    This is the unit of parallelism: every outer fold of every repetition is
+    independent given (X, y, groups) and its own index arrays, so all
+    OUTER_SPLITS * n_repeats of them go into a single joblib work queue rather
+    than being sharded by repetition (a queue load-balances; fixed shards leave
+    workers idle at the end). Hyperparameter search happens here, inside the
+    outer training set, so the outer test fold stays untouched by selection.
+
+    Returns the fold's record; predictions go to the .npz so a resumed run can
+    reassemble folds it did not refit.
+    """
+    started = time.time()
+    X, y, groups = _worker_data(data_dir)
+
+    X_train = X.iloc[train_idx].reset_index(drop=True)
+    X_test = X.iloc[test_idx].reset_index(drop=True)
+    y_train = y.iloc[train_idx].reset_index(drop=True)
+    y_test = y.iloc[test_idx].reset_index(drop=True)
+    groups_train = groups.iloc[train_idx].reset_index(drop=True)
+
+    inner_cv = GroupKFold(n_splits=INNER_SPLITS)
+    categorical_features = categorical_cols + boolean_cols
+    shap_values = None
+
+    if model == "elastic_net":
+        if imputation == "simple":
+            # imputation happens inside the pipeline, per trial
+            study = run_optuna_search_simple_imputation_elastic_net(
+                X_train, y_train, inner_cv, groups_train,
+                categorical_cols, boolean_cols, numerical_cols, n_trials=n_trials,
+            )
+            best_params = study.best_params
+
+            best_model = create_elastic_net_pipeline(
+                categorical_cols, boolean_cols, numerical_cols
+            )
+            best_model.set_params(
+                elasticnet__alpha=best_params["alpha"],
+                elasticnet__l1_ratio=best_params["l1_ratio"],
+            )
+            best_model.fit(X_train, y_train)
+            y_pred = best_model.predict(X_test)
+            X_train_used = X_train
+
+        else:  # missforest
+            # impute each inner fold once (leakage-free), search over cache
+            cached_folds = impute_inner_folds(
+                X_train, y_train, groups_train, inner_cv,
+                categorical_features, iterations=3
+            )
+            study = run_optuna_search_missforest_imputation_elastic_net(
+                cached_folds, categorical_cols, boolean_cols, numerical_cols,
+                n_trials=n_trials,
+            )
+            best_params = study.best_params
+
+            # impute outer train/test for the final fold model (fit on
+            # outer-train only, applied to outer-test)
+            X_train_imp, X_test_imp = missforest_impute(
+                X_train, X_test, categorical_features, max_iter=3
+            )
+
+            best_model = create_elastic_net_pipeline(
+                categorical_cols, boolean_cols, numerical_cols,
+                include_imputers=False
+            )
+            best_model.set_params(
+                elasticnet__alpha=best_params["alpha"],
+                elasticnet__l1_ratio=best_params["l1_ratio"],
+            )
+            best_model.fit(X_train_imp, y_train)
+            y_pred = best_model.predict(X_test_imp)
+            X_train_used = X_train_imp
+
+    elif model == "xgboost":
+        study = run_optuna_search_xgboost(
+            X_train, y_train, inner_cv, groups_train, n_trials=n_trials
+        )
+        best_params = study.best_params
+
+        best_model = xgb.XGBRegressor(
+            tree_method="hist",  # histogram-based approximate splits; required for enable_categorical
+            enable_categorical=True,
+            objective="reg:squarederror",
+            random_state=SEED,
+            n_jobs=1,  # the outer joblib pool owns the cores
+            **best_params
+        )
+        best_model.fit(X_train, y_train)
+        y_pred = best_model.predict(X_test)
+        X_train_used = X_train
+
+        if collect_shap:
+            # Out-of-sample SHAP on this fold's held-out rows. The default
+            # tree_path_dependent perturbation reads the tree structure (via
+            # XGBoost's native pred_contribs), so it needs no background data
+            # and handles enable_categorical=True.
+            explainer = shap.TreeExplainer(best_model)
+            shap_values = explainer.shap_values(X_test)
+
+    # Apparent (in-sample) R²: the model re-scored on the data it was fit on.
+    # The gap apparent - test R² is the optimism that pmsampsize/shrinkage
+    # bounds; a large gap is the direct signature of overfitting.
+    record = {
+        "repeat": repeat,
+        "fold": fold,
+        "params": best_params,
+        "train_r2": float(r2_score(y_train, best_model.predict(X_train_used))),
+        "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+        "mae": float(mean_absolute_error(y_test, y_pred)),
+        "r2": float(r2_score(y_test, y_pred)),
+        "n_train": int(len(train_idx)),
+        "n_test": int(len(test_idx)),
+        "seconds": round(time.time() - started, 1),
+    }
+
+    # Write predictions first, the record second: the .json appearing is what
+    # marks the fold done, so an interrupted write can never look complete.
+    pred_path, record_path = fold_paths(run_dir, repeat, fold)
+    arrays = {"test_idx": np.asarray(test_idx), "y_pred": np.asarray(y_pred)}
+    if shap_values is not None:
+        arrays["shap_values"] = np.asarray(shap_values)
+    np.savez(f"{pred_path}.tmp.npz", **arrays)
+    os.replace(f"{pred_path}.tmp.npz", pred_path)
+    with open(f"{record_path}.tmp", "w") as fh:
+        json.dump(record, fh)
+    os.replace(f"{record_path}.tmp", record_path)
+    return record
 
 def print_model_summary(model_type, model, best_params):
     if model_type == "elastic_net":
@@ -290,36 +574,92 @@ def print_model_summary(model_type, model, best_params):
             print(f"    {k:<30} {v}")
 
 
-def print_cv_results(fold_params, test_rmse_scores, test_r2_scores, test_mae_scores,
-                     train_r2_scores):
+def summarise_repeats(values):
+    """(mean, 2.5th percentile, 97.5th percentile) of one metric over repetitions.
+
+    The interval is the central 95% of the *repetition* estimates: it says how
+    far the reported number moves when the participant partition is re-drawn.
+    It is a stability interval, not a confidence interval for performance in a
+    new sample -- it carries no information about sampling error beyond this
+    cohort, and will be narrower than one that did.
+    """
+    values = np.asarray(values, dtype=float)
+    lo, hi = np.percentile(values, [2.5, 97.5])
+    return float(values.mean()), float(lo), float(hi)
+
+def print_cv_results(fold_records, repeat_records, n_repeats):
+    """Report the outer CV per repetition, then summarise across repetitions.
+
+    Per-fold lines are deliberately not printed: at OUTER_SPLITS x n_repeats
+    they run to a thousand rows and say little individually. Each fold's
+    parameters and metrics are in its checkpoint .json if needed; what is
+    printed here is the per-repetition estimate and its spread.
+    """
     print("\n" + "="*50)
     print("CROSS-VALIDATION RESULTS")
     print("="*50)
+    print(f"\nOuter CV:  RepeatedGroupKFold, {OUTER_SPLITS} folds x {n_repeats} "
+          f"repetitions ({OUTER_SPLITS * n_repeats} fits)")
+    print(f"Inner CV:  GroupKFold, {INNER_SPLITS} folds (tuning, per outer fold)")
+    total_hours = sum(r["seconds"] for r in fold_records) / 3600
+    print(f"Compute:   {total_hours:.2f} core-hours across all folds")
 
-    print("\nBest parameters in each fold:")
-    for i, params in enumerate(fold_params, 1):
-        print(f"  Fold {i}: {params}")
+    # One line per repetition. Every window is held out exactly once within a
+    # repetition, so these metrics are scored over the full dataset from a
+    # single pooled out-of-fold prediction vector -- directly comparable across
+    # repetitions, and free of the unequal-denominator problem that averaging
+    # per-fold metrics would carry (RepeatedGroupKFold balances folds by
+    # participant count, not by window count).
+    print(f"\nOut-of-fold metrics per repetition (pooled over the repetition's "
+          f"{OUTER_SPLITS} folds):")
+    for rec in repeat_records:
+        print(f"  Repeat {rec['repeat']:>3}: RMSE = {rec['rmse']:.4f}, "
+              f"MAE = {rec['mae']:.4f}, test R² = {rec['r2']:>7.4f}, "
+              f"train R² = {rec['train_r2']:>7.4f}, "
+              f"optimism = {rec['train_r2'] - rec['r2']:>7.4f}")
 
-    print("\nTest metrics per fold:")
-    for i, (rmse, mae, r2) in enumerate(zip(test_rmse_scores, test_mae_scores, test_r2_scores), 1):
-        print(f"  Fold {i}: RMSE = {rmse:.4f}, MAE = {mae:.4f}, R² = {r2:.4f}")
+    rows = [
+        ("RMSE", [r["rmse"] for r in repeat_records]),
+        ("MAE", [r["mae"] for r in repeat_records]),
+        ("Test R²", [r["r2"] for r in repeat_records]),
+        ("Train R²", [r["train_r2"] for r in repeat_records]),
+        # Optimism: apparent (train) R² minus held-out (test) R². A large
+        # positive gap means the model is fitting noise. Train R² has no pooled
+        # analogue (outer training sets overlap), so it is the mean over the
+        # repetition's folds.
+        ("Optimism", [r["train_r2"] - r["r2"] for r in repeat_records]),
+    ]
 
-    # Overfitting check: apparent (train) R² vs held-out (test) R². The optimism
-    # is their difference; a large positive gap means the model is fitting noise.
-    print("\nOverfitting check (apparent vs held-out R² per fold):")
-    optimism = []
-    for i, (tr, te) in enumerate(zip(train_r2_scores, test_r2_scores), 1):
-        gap = tr - te
-        optimism.append(gap)
-        print(f"  Fold {i}: train R² = {tr:.4f}, test R² = {te:.4f}, optimism = {gap:.4f}")
-
-    print("\nSummary:")
-    print(f"  RMSE:        {np.mean(test_rmse_scores):.4f} ± {np.std(test_rmse_scores):.4f}")
-    print(f"  MAE:         {np.mean(test_mae_scores):.4f} ± {np.std(test_mae_scores):.4f}")
-    print(f"  Test R²:     {np.mean(test_r2_scores):.4f} ± {np.std(test_r2_scores):.4f}")
-    print(f"  Train R²:    {np.mean(train_r2_scores):.4f} ± {np.std(train_r2_scores):.4f}")
-    print(f"  Optimism:    {np.mean(optimism):.4f} ± {np.std(optimism):.4f}  (train - test R²)")
+    print(f"\nSummary (mean [2.5th, 97.5th percentile] over {n_repeats} repetitions):")
+    for label, values in rows:
+        mean, lo, hi = summarise_repeats(values)
+        note = "  (train - test R²)" if label == "Optimism" else ""
+        print(f"  {label + ':':<12} {mean:.4f}  [{lo:.4f}, {hi:.4f}]{note}")
     print("="*50 + "\n")
+
+def print_hyperparameter_stability(fold_records):
+    """Distribution of the selected hyperparameters over every outer fold.
+
+    With five folds this was noise; over OUTER_SPLITS x n_repeats independent
+    tunings it is a result in its own right -- a tight spread means the data
+    identify the setting sharply, a wide one means the inner CV is largely
+    choosing at random and the model is insensitive to the choice.
+    """
+    print("="*50)
+    print("HYPERPARAMETER STABILITY (over all outer folds)")
+    print("="*50)
+    keys = list(dict.fromkeys(k for rec in fold_records for k in rec["params"]))
+    print(f"\n  {'Parameter':<22} {'median':>12} {'IQR':>26} {'min':>12} {'max':>12}")
+    print("  " + "-" * 86)
+    for key in keys:
+        values = [rec["params"][key] for rec in fold_records if key in rec["params"]]
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            continue
+        arr = np.asarray(values, dtype=float)
+        q25, q50, q75 = np.percentile(arr, [25, 50, 75])
+        print(f"  {key:<22} {q50:>12.5g} {f'[{q25:.5g}, {q75:.5g}]':>26} "
+              f"{arr.min():>12.5g} {arr.max():>12.5g}")
+    print()
 
 def plot_calibration(y_true, y_pred, run_tag, model, title="Calibration: Actual vs Predicted"):
     y_true = np.asarray(y_true)
@@ -390,6 +730,34 @@ def plot_calibration(y_true, y_pred, run_tag, model, title="Calibration: Actual 
     print(f"Calibration plot saved to {out_path_svg}")
     return {"alpha": alpha, "beta": beta, "cil": cil, "r2": r2, "rmse": rmse, "mae": mae}
 
+def print_calibration_stability(y_true, oof_pred):
+    """Calibration intercept/slope/CIL across every repetition's out-of-fold pass.
+
+    The scatter plot shows one repetition; these are the same three quantities
+    refit on each of the n_repeats pooled prediction vectors, so the spread says
+    how much the calibration conclusion depends on the partition drawn. Cheap --
+    one polyfit per repetition, no refitting of models.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    stats = {"alpha": [], "beta": [], "cil": []}
+    for r in range(oof_pred.shape[1]):
+        pred = oof_pred[:, r]
+        beta, alpha = np.polyfit(pred, y_true, 1)  # (x, y) = (pred, true)
+        stats["alpha"].append(alpha)
+        stats["beta"].append(beta)
+        stats["cil"].append(y_true.mean() - pred.mean())
+
+    print("="*50)
+    print("CALIBRATION STABILITY (over repetitions)")
+    print("="*50)
+    labels = {"alpha": "α (intercept)", "beta": "β (slope)", "cil": "CIL"}
+    print(f"\n  {'Quantity':<16} {'mean':>10}  [2.5th, 97.5th pct]")
+    print("  " + "-" * 52)
+    for key, values in stats.items():
+        mean, lo, hi = summarise_repeats(values)
+        print(f"  {labels[key]:<16} {mean:>10.4f}  [{lo:.4f}, {hi:.4f}]")
+    print()
+
 def build_feature_description_map():
     """Build a mapping from feature column names to human-readable descriptions.
 
@@ -425,9 +793,12 @@ def plot_shap_beeswarm(shap_values_folds, X_test_folds, run_tag, model,
 
     Each (shap_values, X_test) pair comes from one outer fold: the SHAP values
     were computed by a TreeExplainer over the fold model on its held-out rows,
-    so every sample is explained out-of-sample. The five test folds partition
-    the dataset, so stacking them row-wise reconstructs one SHAP value per
-    (row, feature) for the full dataset. The blocks share the same feature
+    so every sample is explained out-of-sample. The folds passed in are the
+    OUTER_SPLITS folds of a single repetition (PLOT_REPEAT), which partition the
+    dataset, so stacking them row-wise reconstructs one SHAP value per
+    (row, feature) for the full dataset. Restricting to one repetition is what
+    keeps that one-value-per-row property -- pooling every repetition would
+    stack n_repeats explanations of the same rows. The blocks share the same feature
     columns, so np.vstack / pd.concat glue them vertically and stay row-aligned
     (both preserve fold order), which is what summary_plot needs to color each
     dot by its feature value.
@@ -476,7 +847,11 @@ def plot_shap_beeswarm(shap_values_folds, X_test_folds, run_tag, model,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="PHQ-8 regression with nested grouped CV."
+        description=(
+            f"PHQ-8 regression with repeated nested grouped CV "
+            f"({OUTER_SPLITS}-fold outer x --n-repeats repetitions, "
+            f"{INNER_SPLITS}-fold inner tuning)."
+        )
     )
     parser.add_argument(
         "--feature-set",
@@ -518,7 +893,51 @@ def parse_args():
         default="elastic_net",
         help="Predictive model. Default: elastic_net.",
     )
+    parser.add_argument(
+        "--n-repeats",
+        type=int,
+        default=100,
+        help=(
+            "Number of outer-CV repetitions (independent participant partitions). "
+            "Each contributes one pooled out-of-fold performance estimate; the "
+            "summary reports their mean and 2.5th/97.5th percentiles. Total outer "
+            f"fits = {OUTER_SPLITS} x this. Default: 100."
+        ),
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=8,
+        help=(
+            "Worker processes for the outer folds. Folds are queued individually "
+            "so the pool self-balances. Inner parallelism is forced to 1 in the "
+            "workers, so this is the only parallel layer. Default: 8."
+        ),
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=None,
+        help=(
+            "Optuna trials per outer fold. Default: "
+            + ", ".join(f"{m} {n}" for m, n in DEFAULT_TRIALS.items()) + "."
+        ),
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Discard existing fold checkpoints for this configuration before "
+            "running. Without it, completed folds are reused and only the "
+            "missing ones are fitted."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.n_repeats < 1:
+        parser.error("--n-repeats must be at least 1.")
+    if args.n_jobs < 1:
+        parser.error("--n-jobs must be at least 1.")
 
     # Normalize the selected families to a fixed order and drop duplicates, so
     # the run tag / output filename are deterministic regardless of CLI order.
@@ -534,6 +953,12 @@ def parse_args():
     args.catch22_enabled = args.window_size in catch22_enabled_windows()
     _c22 = "c22" if args.catch22_enabled else "noc22"
     args.fraction_tag = f"mp{args.min_present_fraction:g}_{_c22}"
+
+    # Resolved after the model is known so the help text can advertise both
+    # defaults while the run records the single number actually used (it is part
+    # of the checkpoint identity -- changing it invalidates cached folds).
+    if args.n_trials is None:
+        args.n_trials = DEFAULT_TRIALS[args.model]
 
     # XGBoost handles missing values natively; imputation must not be applied.
     if args.model == "xgboost":
@@ -568,6 +993,11 @@ def main(args):
     else:
         print(f"  Imputation:   {args.imputation}")
     print(f"  Model:        {args.model}")
+    print(f"  Outer CV:     RepeatedGroupKFold, {OUTER_SPLITS} folds x "
+          f"{args.n_repeats} repeats ({OUTER_SPLITS * args.n_repeats} fits)")
+    print(f"  Inner CV:     GroupKFold, {INNER_SPLITS} folds")
+    print(f"  Optuna:       {args.n_trials} trials per outer fold")
+    print(f"  Workers:      {args.n_jobs}")
     print("="*50)
 
     log(f"Run: {args.model} | {args.imputation} | {args.feature_set_tag} | "
@@ -650,161 +1080,117 @@ def main(args):
     categorical_features = categorical_cols + all_boolean_cols
     numerical_cols = [c for c in X.columns if c not in categorical_features]
 
-    outer_cv = GroupKFold(n_splits=5)
-    inner_cv = GroupKFold(n_splits=3)
+    # Positional indices are the contract between the splitter, the checkpoint
+    # files and the OOF matrix, so pin the frames to a clean RangeIndex once.
+    X = X.reset_index(drop=True)
+    y = y.reset_index(drop=True)
+    groups = groups.reset_index(drop=True)
 
-    test_rmse_scores = []
-    test_r2_scores = []
-    test_mae_scores = []
-    train_r2_scores = []
-    fold_params = []
-    y_true_all = []
-    y_pred_all = []
-    # Out-of-fold SHAP: one (shap_values, X_test) block per outer fold, pooled
-    # after the loop into a single beeswarm (XGBoost only).
+    outer_cv = RepeatedGroupKFold(
+        n_splits=OUTER_SPLITS, n_repeats=args.n_repeats, random_state=SEED
+    )
+
+    # Enumerate every (repetition, fold) up front. Index generation is free --
+    # only the fitting is expensive -- and a flat task list is what lets one
+    # joblib queue load-balance all of them. get_n_splits() reports folds x
+    # repeats, so the repetition a fold belongs to comes from outer_cv.n_splits.
+    tasks = []
+    for i, (train_idx, test_idx) in enumerate(outer_cv.split(X, y, groups)):
+        repeat, fold = divmod(i, outer_cv.n_splits)
+        tasks.append((repeat, fold, train_idx, test_idx))
+
+    n_outer = len(tasks)
+    log(f"X={X.shape}, y={len(y)} | {n_outer} outer fits "
+        f"({OUTER_SPLITS} folds x {args.n_repeats} repeats)")
+
+    run_key = run_key_for(args)
+    run_dir, data_dir = prepare_run_dir(args, run_key, X, y, groups, log)
+
+    # Resume: a fold whose record exists is complete and is not refitted. Its
+    # predictions are read back from the .npz at assembly time, so reused and
+    # freshly fitted folds are handled identically.
+    pending = [t for t in tasks if not os.path.exists(fold_paths(run_dir, t[0], t[1])[1])]
+    done = n_outer - len(pending)
+    if done:
+        log(f"Resuming from {run_dir}: {done}/{n_outer} folds already complete")
+
+    if pending:
+        log(f"Fitting {len(pending)} outer folds on {args.n_jobs} workers "
+            f"(inner parallelism forced to 1)")
+        # inner_max_num_threads=1 stops BLAS/OpenMP from spawning a full thread
+        # pool inside every worker; with LightGBM/XGBoost n_jobs=1 and the
+        # Optuna searches at n_jobs=1, the outer pool is the only parallel layer.
+        # batch_size=1 keeps the queue fine-grained, so a worker that draws a
+        # slow fold does not also hold a batch of unstarted ones.
+        with parallel_config(backend="loky", inner_max_num_threads=1):
+            Parallel(n_jobs=args.n_jobs, batch_size=1, verbose=10)(
+                delayed(run_outer_fold)(
+                    repeat, fold, train_idx, test_idx, data_dir, run_dir,
+                    categorical_cols, all_boolean_cols, numerical_cols,
+                    args.model, args.imputation, args.n_trials,
+                    collect_shap=(args.model == "xgboost" and repeat == PLOT_REPEAT),
+                )
+                for repeat, fold, train_idx, test_idx in pending
+            )
+
+    # --- assemble the out-of-fold predictions ------------------------------
+    log("All folds complete; assembling out-of-fold predictions...")
+    # Column r holds repetition r's predictions. Within a repetition the folds
+    # partition the dataset, so every cell is written exactly once.
+    oof_pred = np.full((len(y), args.n_repeats), np.nan)
+    fold_records = []
+    # Out-of-fold SHAP: one (shap_values, X_test) block per fold of PLOT_REPEAT,
+    # pooled into a single beeswarm (XGBoost only).
     shap_values_all = []
     X_test_all = []
 
-    n_outer = outer_cv.get_n_splits()
-    log(f"X={X.shape}, y={len(y)} | starting {n_outer}-fold outer CV")
+    for repeat, fold, _, _ in tasks:
+        pred_path, record_path = fold_paths(run_dir, repeat, fold)
+        with open(record_path) as fh:
+            fold_records.append(json.load(fh))
+        with np.load(pred_path) as arrays:
+            oof_pred[arrays["test_idx"], repeat] = arrays["y_pred"]
+            if "shap_values" in arrays and repeat == PLOT_REPEAT:
+                shap_values_all.append(arrays["shap_values"])
+                X_test_all.append(X.iloc[arrays["test_idx"]].reset_index(drop=True))
 
-    for fold_idx, (train_idx, test_idx) in enumerate(
-        outer_cv.split(X, y, groups), 1
-    ):
-        log(f"Outer fold {fold_idx}/{n_outer}: train={len(train_idx)}, test={len(test_idx)}")
+    missing = np.isnan(oof_pred).sum(axis=0)
+    if missing.any():
+        sys.exit(
+            f"Out-of-fold matrix is incomplete: repetitions "
+            f"{np.flatnonzero(missing).tolist()} have unpredicted rows. "
+            f"Delete {run_dir} or re-run with --fresh."
+        )
 
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    # One performance estimate per repetition, scored once over that
+    # repetition's pooled predictions (i.e. over the full dataset).
+    repeat_records = []
+    for r in range(args.n_repeats):
+        pred = oof_pred[:, r]
+        fold_train_r2 = [rec["train_r2"] for rec in fold_records if rec["repeat"] == r]
+        repeat_records.append({
+            "repeat": r,
+            "rmse": float(np.sqrt(mean_squared_error(y, pred))),
+            "mae": float(mean_absolute_error(y, pred)),
+            "r2": float(r2_score(y, pred)),
+            "train_r2": float(np.mean(fold_train_r2)),
+        })
 
-        groups_train = groups.iloc[train_idx]
-
-        # Reset indices once so X/y remain positionally aligned with the
-        # imputer output and any downstream positional indexing.
-        X_train = X_train.reset_index(drop=True)
-        X_test = X_test.reset_index(drop=True)
-        y_train = y_train.reset_index(drop=True)
-        y_test = y_test.reset_index(drop=True)
-        groups_train = groups_train.reset_index(drop=True)
-
-        # --- model selection -----------------------------------------------
-        if args.model == "elastic_net":
-
-            if args.imputation == "simple":
-                # imputation happens inside the pipeline, per trial
-                log(f"  fold {fold_idx}: Optuna search (elastic_net, simple imputation)...")
-                study = run_optuna_search_simple_imputation_elastic_net(
-                    X_train, y_train, inner_cv, groups_train,
-                    categorical_cols, all_boolean_cols, numerical_cols
-                )
-                best_params = study.best_params
-
-                best_model = create_elastic_net_pipeline(
-                    categorical_cols, all_boolean_cols, numerical_cols
-                )
-                best_model.set_params(
-                    elasticnet__alpha=best_params["alpha"],
-                    elasticnet__l1_ratio=best_params["l1_ratio"]
-                )
-                best_model.fit(X_train, y_train)
-                y_pred = best_model.predict(X_test)
-                X_train_used = X_train
-
-            elif args.imputation == "missforest":
-                # impute each inner fold once (leakage-free), search over cache
-                log(f"  fold {fold_idx}: imputing inner folds (MissForest)...")
-                cached_folds = impute_inner_folds(
-                    X_train, y_train, groups_train, inner_cv,
-                    categorical_features, iterations=3
-                )
-                log(f"  fold {fold_idx}: Optuna search (elastic_net, missforest)...")
-                study = run_optuna_search_missforest_imputation_elastic_net(
-                    cached_folds, categorical_cols,
-                    all_boolean_cols, numerical_cols
-                )
-                best_params = study.best_params
-
-                # impute outer train/test for the final fold model (fit on
-                # outer-train only, applied to outer-test)
-                log(f"  fold {fold_idx}: imputing outer train/test (MissForest)...")
-                X_train_imp, X_test_imp = missforest_impute(
-                    X_train, X_test, categorical_features, max_iter=3
-                )
-
-                best_model = create_elastic_net_pipeline(
-                    categorical_cols, all_boolean_cols, numerical_cols,
-                    include_imputers=False
-                )
-                best_model.set_params(
-                    elasticnet__alpha=best_params["alpha"],
-                    elasticnet__l1_ratio=best_params["l1_ratio"]
-                )
-                best_model.fit(X_train_imp, y_train)
-                y_pred = best_model.predict(X_test_imp)
-                X_train_used = X_train_imp
-
-        elif args.model == "xgboost":
-            log(f"  fold {fold_idx}: Optuna search (xgboost)...")
-            study = run_optuna_search_xgboost(X_train, y_train, inner_cv, groups_train)
-            best_params = study.best_params
-
-            best_model = xgb.XGBRegressor(
-                tree_method="hist",  # histogram-based approximate splits; required for enable_categorical
-                enable_categorical = True,
-                objective="reg:squarederror",
-                random_state=SEED,
-                **best_params
-            )
-
-            best_model.fit(X_train, y_train)
-            y_pred = best_model.predict(X_test)
-            X_train_used = X_train
-
-            # Out-of-sample SHAP on this fold's held-out rows. The default
-            # tree_path_dependent perturbation reads the tree structure (via
-            # XGBoost's native pred_contribs), so it needs no background data
-            # and handles enable_categorical=True.
-            explainer = shap.TreeExplainer(best_model)
-            shap_values_all.append(explainer.shap_values(X_test))
-            X_test_all.append(X_test)
-
-
-        fold_params.append(best_params)
-
-        y_true_all.extend(y_test)
-        y_pred_all.extend(y_pred)
-
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r2 = r2_score(y_test, y_pred)
-        mae = mean_absolute_error(y_test, y_pred)
-
-        # Apparent (in-sample) R²: the model re-scored on the data it was fit on.
-        # The gap apparent - test R² is the optimism that pmsampsize/shrinkage
-        # bounds; a large gap is the direct signature of overfitting.
-        train_r2 = r2_score(y_train, best_model.predict(X_train_used))
-
-        test_rmse_scores.append(rmse)
-        test_r2_scores.append(r2)
-        test_mae_scores.append(mae)
-        train_r2_scores.append(train_r2)
-
-        log(f"  fold {fold_idx} done: RMSE={rmse:.3f}, MAE={mae:.3f}, "
-            f"test R2={r2:.3f}, train R2={train_r2:.3f}")
-
-    log("Outer CV complete; fitting final model on full dataset...")
-    print_cv_results(
-        fold_params,
-        test_rmse_scores,
-        test_r2_scores,
-        test_mae_scores,
-        train_r2_scores
-    )
+    print_cv_results(fold_records, repeat_records, args.n_repeats)
+    print_hyperparameter_stability(fold_records)
 
     imputation_label = "simple_imputation" if args.imputation == "simple" else args.imputation
     run_tag = (f"{args.model}_{imputation_label}_{args.feature_set_tag}"
                f"_w{args.window_size}_{args.fraction_tag}_{args.timestamp}")
-    plot_calibration(y_true_all, y_pred_all, run_tag, args.model)
+    # One repetition's complete out-of-fold pass. Averaging predictions across
+    # repetitions instead would be an ensemble, and would flatter the slope.
+    plot_calibration(
+        y, oof_pred[:, PLOT_REPEAT], run_tag, args.model,
+        title=f"Calibration: Actual vs Predicted (repetition {PLOT_REPEAT})",
+    )
+    print_calibration_stability(y, oof_pred)
 
-    if args.model == "xgboost":
+    if args.model == "xgboost" and shap_values_all:
         shap_ranking = plot_shap_beeswarm(shap_values_all, X_test_all, run_tag, args.model)
         print("\n" + "="*50)
         print("SHAP FEATURE IMPORTANCE (mean |SHAP| over out-of-fold test rows)")
@@ -818,13 +1204,18 @@ def main(args):
     print("FINAL MODEL (tuned and fit on full dataset)")
     print("="*50)
 
-    final_cv = GroupKFold(n_splits=5)
+    log("Fitting final model on full dataset...")
+    # Same grouped tuning CV as the outer folds use internally. This search runs
+    # in the driver with no worker pool competing for cores, so it takes the
+    # cores (n_jobs=-1) and shows its progress bar.
+    final_cv = GroupKFold(n_splits=INNER_SPLITS)
 
     if args.model == "elastic_net":
         if args.imputation == "simple":
             final_study = run_optuna_search_simple_imputation_elastic_net(
                 X, y, final_cv, groups,
                 categorical_cols, all_boolean_cols, numerical_cols,
+                n_trials=args.n_trials, n_jobs=-1, show_progress=True,
             )
             final_best_params = final_study.best_params
             print(f"  Best params: {final_best_params}")
@@ -845,6 +1236,7 @@ def main(args):
             final_study = run_optuna_search_missforest_imputation_elastic_net(
                 final_cached_folds, categorical_cols,
                 all_boolean_cols, numerical_cols,
+                n_trials=args.n_trials, show_progress=True,
             )
             final_best_params = final_study.best_params
             print(f"  Best params: {final_best_params}")
@@ -862,7 +1254,10 @@ def main(args):
             final_model.fit(X_imp, y)
 
     elif args.model == "xgboost":
-        final_study = run_optuna_search_xgboost(X, y, final_cv, groups)
+        final_study = run_optuna_search_xgboost(
+            X, y, final_cv, groups,
+            n_trials=args.n_trials, n_jobs=-1, show_progress=True,
+        )
         final_best_params = final_study.best_params
         print(f"  Best params: {final_best_params}")
         final_model = xgb.XGBRegressor(
