@@ -10,10 +10,11 @@ ID_COLUMNS = ["participant_name", "timeInterval_ID"]
 
 # Only steps columns that are consumed downstream (a basic `steps:` feature or a
 # catch22 `base_features` signal in feature_spec.yaml) are winsorized here —
-# winsorizing a column that never becomes a feature adds nothing. FEATURE_007 is
-# catch22-only (not in the `steps:` section). Column numbers below are the
-# FEATURE_0NN suffixes from the steps feature dictionary (e.g. "feature 1"
-# -> FEATURE_001). FEATURE_022 ("most active hour") is a circular time-of-day
+# winsorizing a column that never becomes a feature adds nothing. Every catch22
+# steps signal is currently also a `steps:` feature, so this mirrors that section.
+# Column numbers below are the FEATURE_0NN suffixes from the steps feature
+# dictionary (e.g. "feature 1" -> FEATURE_001).
+# FEATURE_022 ("most active hour") is a circular time-of-day
 # column and is intentionally left uncapped: quantile clipping is meaningless for
 # circular values.
 #
@@ -30,7 +31,6 @@ WINSORIZE_LIMITS = {
     "FEATURE_039": (0.25, 0.99),
     "FEATURE_040": (None, 0.99),
     "FEATURE_021": (None, 0.99),
-    "FEATURE_007": (None, 0.99),
 }
 
 

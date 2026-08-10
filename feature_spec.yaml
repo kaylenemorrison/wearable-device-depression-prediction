@@ -21,11 +21,11 @@
 meta:
   demographic_raw: 4                           # raw predictor columns: age, gender, mh_smoking, audit_1 (phq8_score is outcome)
   demographic_feature_count: 8                 # after one-hot: age(1) + gender(1, binary) + mh_smoking(2, 3 levels-1) + audit_1(4, 5 levels-1)
-  basic_feature_count: 74                      # see per-stream subtotals below
+  basic_feature_count: 70                      # sleep(26) + heartrate(16) + activity(15) + steps(13); see per-stream subtotals below
   slope_feature_count: 25                      # 1 OLS slope per non-circular/non-binary signal; see `slope:`
   catch22_feature_count: 45                    # fixed panel (5) x base set (9); see `catch22:`
   adherence_feature_count: 8                   # missing_last + missing_consecutive_max per stream (4 streams)
-  total_feature_count: 160                     # demographics(8) + basic(74) + slope(25) + catch22(45) + adherence(8)
+  total_feature_count: 156                     # demographics(8) + basic(70) + slope(25) + catch22(45) + adherence(8)
 
   # Output naming convention (matches merge_datasets.py): "<stream>_<col>_<stat>".
   # mean is intentionally DROPPED where median is present (collinear); median is
@@ -200,7 +200,7 @@ slope:
 # panel across more signals buys more independent dynamical information, and the
 # basic aggregations already cover level/spread.
 #
-# Budget: 5 panel features x 8 base signals = 40.
+# Budget: 5 panel features x 9 base signals = 45.
 # ===========================================================================
 catch22:
   # --- gating ------------------------------------------------------------
@@ -291,7 +291,7 @@ catch22:
       feature: CO_HistogramAMI_even_2_5
       candidates: [CO_HistogramAMI_even_2_5]
 
-  # --- base signals the panel is applied to (~10) ------------------------
+  # --- base signals the panel is applied to (9) --------------------------
   # catch22 assumes a linear, z-normalizable series, so circular time-of-day
   # columns (sleep_onset/offset/midpoint, most-active-hour) are NEVER included.
   # Sleep is capped at 2 signals: its catch22 coverage is only ~43-44% at the
@@ -313,4 +313,4 @@ catch22:
     - { signal: activity.FEATURE_001,   symptom_tail: high }   # very sedentary days (cf. total)
     - { signal: activity.FEATURE_016,   symptom_tail: low }    # inactive / few active-hours days (cf. level_low)
     - { signal: steps.FEATURE_001,      symptom_tail: low }    # low-step days (cf. total_low)
-    - { signal: steps.FEATURE_007,      symptom_tail: low }    # reduced step variability / monotonous rhythm
+    - { signal: steps.FEATURE_019,      symptom_tail: high }   # nighttime steps: nocturnal restlessness marker
