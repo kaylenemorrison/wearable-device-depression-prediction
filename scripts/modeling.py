@@ -46,7 +46,7 @@ OUTER_SPLITS = 10
 INNER_SPLITS = 5
 
 # Optuna budget per outer fold, overridable with --n-trials.
-DEFAULT_TRIALS = {"elastic_net": 40, "xgboost": 40}
+DEFAULT_TRIALS = {"elastic_net": 20, "xgboost": 40}
 
 # Repetition whose out-of-fold pass backs the calibration scatter and the SHAP
 # beeswarm. One repetition is one complete partition of the dataset, which is
@@ -193,7 +193,7 @@ def create_elastic_net_pipeline(categorical_cols, boolean_cols, numerical_cols,
         ("elasticnet", ElasticNet(random_state=42, max_iter=20000)),
     ])
 
-def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=40, n_jobs=1, show_progress=False):
+def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categorical_cols, all_boolean_cols, numerical_cols, n_trials=20, n_jobs=1, show_progress=False):
     # n_jobs=1 / show_progress=False are the defaults because these searches
     # normally run *inside* a joblib worker that is already one of --n-jobs
     # parallel outer folds: nesting a second parallel layer there oversubscribes
@@ -230,7 +230,7 @@ def run_optuna_search_simple_imputation_elastic_net(X, y, gkf, groups, categoric
     return study
 
 def run_optuna_search_missforest_imputation_elastic_net(cached_folds, categorical_cols,
-                      all_boolean_cols, numerical_cols, n_trials=40,
+                      all_boolean_cols, numerical_cols, n_trials=20,
                       show_progress=False):
     base_pipeline = create_elastic_net_pipeline(
         categorical_cols, all_boolean_cols, numerical_cols, include_imputers=False
